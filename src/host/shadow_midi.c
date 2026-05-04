@@ -416,15 +416,17 @@ void shadow_drain_midi_inject(void)
      * the DSP audio callback queues additional note events (e.g. drum hits on
      * ROUTE_MOVE) in the same window — those arrive 1-2 frames later and land
      * while Move's firmware is mid-transition, causing SIGABRT deep in Move's
-     * stack.  Three frames (~9 ms) gives the firmware time to settle; packets
-     * are not lost — they accumulate in inject_shm and drain after the hold. */
+     * stack.  One frame (~3 ms) is sufficient — the crash occurs when DSP
+     * packets land within the same tick as the transition; one SPI cycle of
+     * settling eliminates the race.  Packets accumulate in inject_shm and
+     * drain after the hold, so no events are lost. */
     {
         static int prev_overtake_hold = 0;
         static int exit_hold = 0;
         shadow_control_t *sc = host_shadow_control ? *host_shadow_control : NULL;
         int cur_overtake = sc ? (int)sc->overtake_mode : 0;
         if (prev_overtake_hold != 0 && cur_overtake == 0)
-            exit_hold = 3;
+            exit_hold = 1;
         prev_overtake_hold = cur_overtake;
         if (exit_hold > 0) {
             exit_hold--;
