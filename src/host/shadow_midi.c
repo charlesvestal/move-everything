@@ -425,7 +425,7 @@ void shadow_drain_midi_inject(void)
         shadow_control_t *sc = host_shadow_control ? *host_shadow_control : NULL;
         int cur_overtake = sc ? (int)sc->overtake_mode : 0;
         if (prev_overtake_hold != 0 && cur_overtake == 0)
-            exit_hold = 3;
+            exit_hold = 2;
         prev_overtake_hold = cur_overtake;
         if (exit_hold > 0) {
             exit_hold--;
