@@ -194,6 +194,11 @@ host_rescan_modules()
 host_get_volume()             // -> int (0-100)
 host_set_volume(vol)          // set host volume
 
+// Jack state and module metadata (used by feedback-protection gate)
+host_speaker_active()         // -> bool (true = built-in speakers, false = headphones plugged)
+host_line_in_connected()      // -> bool (true = line-in cable plugged, false = internal mic)
+host_get_module_metadata(id)  // -> parsed module.json object | null
+
 // Host input settings
 host_get_setting(key)         // -> value (velocity_curve, aftertouch_enabled, aftertouch_deadzone)
 host_set_setting(key, val)    // set setting
@@ -530,6 +535,14 @@ Shadow Mode runs custom signal chains alongside stock Move. The shim intercepts 
 
 ### Shadow Mode Shortcuts
 
+Shadow UI access is gated by **Global Settings → Shortcuts → Shadow UI Trigger** (`shadow_ui_trigger` in `features.json`):
+
+- **Both** (default): both Shift+Vol and long-press work
+- **Long Press**: only long-press works; Shift+Vol combos pass through to Move
+- **Shift+Vol**: only Shift+Vol works; long-press is suppressed
+
+Shift+Vol combos (active in modes Both / Shift+Vol):
+
 - **Shift+Vol+Track 1-4**: Open shadow mode / jump to slot settings (works from Move or Shadow UI)
 - **Shift+Vol+Menu**: Jump directly to Master FX settings
 - **Shift+Vol+Step2**: Open Global Settings
@@ -537,6 +550,16 @@ Shadow Mode runs custom signal chains alongside stock Move. The shim intercepts 
 - **Shift+Vol+Jog Click**: Open Tools menu (overtake modules live below the divider), or exit active overtake module
 - **Shift+Sample**: Open Quantized Sampler
 - **Shift+Capture**: Skipback (save last 30 seconds)
+
+Long-press shortcuts (active in modes Both / Long Press):
+
+- **Hold Track 1-4 (500ms)**: Open that slot's editor
+- **Hold Menu (500ms)**: Open Master FX
+- **Shift + hold Step 2 (500ms)**: Open Global Settings
+- **Shift + Step 13** (immediate): Open Tools menu
+- **Tap Track / Menu** while shadow UI shown: Dismiss shadow UI
+
+Long-press is suppressed for the rest of a track press as soon as the volume knob is touched (so Track-hold + knob to adjust track volume never opens shadow UI). Tracked by `track_vol_touched_during_press[]` in `schwung_shim.c`.
 
 ### Quantized Sampler
 
@@ -547,6 +570,29 @@ Shadow Mode runs custom signal chains alongside stock Move. The shim intercepts 
 - Recordings are saved to `Samples/Schwung/Resampler/YYYY-MM-DD/`
 
 Works for resampling your Move, including Schwung synths, or a line-in source or microphone. You can use Move's built-in count-in for line-in recordings too.
+
+### Feedback Protection
+
+When loading a chain module or launching a tool that consumes line-in
+audio, schwung shows a "Speaker Feedback Risk" warning if built-in
+speakers are active AND no line-in cable is plugged. Press jog click
+to proceed, Back to abort.
+
+The gate fires when:
+- The picked module's `capabilities.audio_in` is `true`, AND
+- Its `component_type` is NOT `audio_fx` or `midi_fx`, AND
+- `shadow_speaker_active` is true (no headphones), AND
+- `shadow_line_in_connected` is false (no line-in cable).
+
+Implementation: `src/shared/feedback_gate.mjs` (predicate +
+Promise-based modal), `src/shadow/shadow_ui.js` (call sites in chain
+slot module pick and tools menu launch), `src/schwung_shim.c`
+(tracks XMOS CC 114 line-in detect alongside CC 115 line-out).
+
+Out of scope: Move firmware's native autosample / line-in
+monitoring; Quantized Sampler "Move Input" source toggle (deferred —
+the fullscreen sampler menu makes a JS-side modal inert; see
+`docs/plans/2026-04-30-feedback-protection-design.md`).
 
 ### Skipback
 
@@ -611,6 +657,27 @@ The shim filters MIDI by USB cable number in the hardware MIDI buffers:
 - External MIDI from cable 2 is routed to `onMidiMessageExternal` in overtake modules
 
 **Important:** If Move tracks are configured to listen and output on the same MIDI channel, external MIDI may be echoed back. Configure Move tracks to use different channels than your external device to avoid interference.
+
+### Cable-2 Channel Remap (Overtake Modules)
+
+Overtake modules can rewrite the MIDI channel of incoming external (cable-2) MIDI before Move's firmware processes it. This solves the "live external MIDI ↔ Move native track" routing problem without re-injecting from JS (which causes the cable-2 echo cascade documented in `docs/MIDI_INJECTION.md`).
+
+**JS API** (available inside `shadow_ui.js` and overtake module contexts):
+
+```javascript
+host_ext_midi_remap_set(in_ch, out_ch)  // 0-15. out_ch >= 16 or < 0 = passthrough
+host_ext_midi_remap_clear()             // reset all 16 entries to passthrough
+host_ext_midi_remap_enable(on)          // global enable/disable
+```
+
+**Behavior:**
+- The shim reads the remap table on every SPI frame (in post-transfer, before the ioctl wrapper returns to Move) and rewrites the channel byte of cable-2 MIDI_IN events in-place. Both the hw mailbox and shadow buffer are mutated, so Move firmware and shim pre-transfer readers see consistent data.
+- System messages (status `0xF*`) are skipped (channelless).
+- The remap is **bypassed globally** whenever any chain slot is configured forward=THRU (MPE passthrough), because remapping channels destroys MPE per-channel expression.
+- The shim **forces a reset** to all-passthrough + `enabled=0` on overtake exit. JS modules don't have to clean up explicitly; even a crashed module won't leak a stale table into the next session.
+- Gated globally by the `ext_midi_remap_enabled` flag in `features.json` (default `true`). Setting this to `false` kills the entire codepath.
+
+**SHM contract:** `/schwung-ext-midi-remap`, 64 bytes, struct `schwung_ext_midi_remap_t` in `src/host/shadow_constants.h`. Version 1 = current.
 
 ### Master FX Chain
 

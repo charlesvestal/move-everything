@@ -37,6 +37,11 @@ import {
 } from '/data/UserData/schwung/shared/chain_ui_views.mjs';
 
 import { decodeDelta } from '/data/UserData/schwung/shared/input_filter.mjs';
+import { knobInit, knobTick, knobConfigFromMeta } from '/data/UserData/schwung/shared/knob_engine.mjs';
+import {
+    formatParamValue as ufFormatParamValue,
+    formatParamForSet as ufFormatParamForSet,
+} from '/data/UserData/schwung/shared/param_format.mjs';
 
 /* Volume touch note for Shift+Vol+Jog detection */
 const VOLUME_TOUCH_NOTE = 8;
@@ -115,6 +120,13 @@ import {
     SET_PAGE_BOX_W,
     SET_PAGE_BOX_H
 } from '/data/UserData/schwung/shared/sampler_overlay.mjs';
+
+import {
+    maybeConfirmForModule,
+    feedbackGateActive,
+    feedbackGateDraw,
+    feedbackGateInput,
+} from '/data/UserData/schwung/shared/feedback_gate.mjs';
 
 import {
     buildFilepathBrowserState,
@@ -310,6 +322,12 @@ let slotDirtyCache = [false, false, false, false];
  * Used to relax the "empty state → bail" guard when the user swaps to a module
  * that lacks state get/set — a module change makes the prior file stale anyway. */
 let lastSavedSlotSignature = ["", "", "", ""];
+/* Set when the user explicitly empties every component in a slot via the
+ * picker. Lets autosave bypass the "shim reports empty but slot has a
+ * preset name" guard (which protects against transient boot-load failures)
+ * for genuine user removals. Reset when the user picks any module, when a
+ * set is loaded, or after the empty marker has been written. */
+let slotUserCleared = [false, false, false, false];
 
 /* Splash screen state */
 let splashActive = true;
@@ -478,6 +496,11 @@ let overtakePassthroughCCs = [];    // CCs declared in capabilities.button_passt
  * (by re-selecting it in the overtake menu) or fully exited. */
 let suspendedOvertakes = {};
 
+/* Most-recently-suspended tool id. Shift+Vol+Step13 double-tap resumes it. */
+let lastSuspendedToolId = "";
+let lastToolsShortcutMs = 0;
+const TOOLS_DOUBLE_TAP_MS = 500;
+
 /* Analytics prompt state */
 const ANALYTICS_PROMPTED_PATH = "/data/UserData/schwung/analytics-prompted";
 let analyticsPromptSelection = 0;  // 0 = Yes (default), 1 = No
@@ -485,6 +508,15 @@ let analyticsPromptSelection = 0;  // 0 = Yes (default), 1 = No
 /* Auto-update state */
 let autoUpdateCheckEnabled = true;   // Default: enabled (opt-out)
 let pendingUpdates = [];              // Updates found on startup
+
+/* Bootstrap-needed banner state. The self-heal mechanism (schwung-heal
+ * setuid + entrypoint that invokes it at boot) requires one-time root
+ * setup that the on-device update path can't perform. Detect at startup
+ * whether the live entrypoint at /opt/move/Move is the new version
+ * (contains the 'schwung-heal' invocation); if not, flag for a one-shot
+ * banner that points the user at the web manager / GUI installer. */
+let shimBootstrapNeeded = false;
+let shimBootstrapPromptShown = false;
 let pendingUpdateIndex = 0;           // Selected update in prompt
 let updateRestartFromVersion = '';    // For restart prompt display
 let updateRestartToVersion = '';
@@ -849,6 +881,13 @@ const GLOBAL_SETTINGS_SECTIONS = [
         ]
     },
     {
+        id: "shortcuts", label: "Shortcuts",
+        items: [
+            { key: "shadow_ui_trigger", label: "Shadow UI Trigger", type: "enum",
+              options: ["Long Press", "Shift+Vol", "Both"], values: [0, 1, 2] }
+        ]
+    },
+    {
         id: "services", label: "Services",
         items: [
             { key: "filebrowser_enabled", label: "File Browser", type: "bool" },
@@ -859,8 +898,14 @@ const GLOBAL_SETTINGS_SECTIONS = [
     {
         id: "updates", label: "Updates",
         items: [
+            /* Detection runs on-device (catalog scan + version compare) so
+             * users can see what's outdated without opening a browser. The
+             * actual install always happens via the web manager (or the
+             * GUI installer as fallback) — the on-device install paths
+             * silently failed for users without a current shim, so we
+             * removed them. */
             { key: "check_updates", label: "[Check Updates]", type: "action" },
-            { key: "module_store", label: "[Module Store]", type: "action" }
+            { key: "module_store",  label: "[Module Store]",  type: "action" }
         ]
     },
     {
@@ -946,18 +991,32 @@ let wavPlayerPendingFile = "";  /* deferred file_path after DSP load */
 let wavPlayerLoadWait = 0;      /* ticks to wait after loading DSP */
 const WAV_PLAYER_DSP = "/data/UserData/schwung/modules/tools/wav-player/dsp.so";
 
+/* Slot 0 overtake-DSP slot is single-tenant. Tracking what's currently loaded
+ * lets resumeOvertakeModule detect "another tool clobbered my DSP" and reload
+ * (Bug C, captured 2026-05-04). All overtake_dsp:load/unload sites must go
+ * through these helpers so the tracker stays accurate. */
+let currentSlot0DspPath = "";
+function loadOvertakeDsp(path) {
+    if (typeof shadow_set_param !== "function") return;
+    shadow_set_param(0, "overtake_dsp:load", path);
+    currentSlot0DspPath = path || "";
+}
+function unloadOvertakeDsp() {
+    if (typeof shadow_set_param !== "function") return;
+    shadow_set_param(0, "overtake_dsp:unload", "1");
+    currentSlot0DspPath = "";
+}
+
 function loadWavPlayerDsp() {
     if (wavPlayerLoaded) return;
-    if (typeof shadow_set_param !== "function") return;
-    shadow_set_param(0, "overtake_dsp:load", WAV_PLAYER_DSP);
+    loadOvertakeDsp(WAV_PLAYER_DSP);
     wavPlayerLoaded = true;
     wavPlayerLoadWait = 2; /* wait 2 ticks for C-side to process load */
 }
 
 function unloadWavPlayerDsp() {
     if (!wavPlayerLoaded) return;
-    if (typeof shadow_set_param !== "function") return;
-    shadow_set_param(0, "overtake_dsp:unload", "1");
+    unloadOvertakeDsp();
     wavPlayerLoaded = false;
     wavPlayerPendingFile = "";
     wavPlayerLoadWait = 0;
@@ -1092,26 +1151,131 @@ let storePickerFromSettings = false;  // True if entered from MFX settings (full
 let storeCategoryIndex = 0;           // Selected index in category browser
 let storeCategoryItems = [];          // Built category list with counts
 
-/* Check if host update is available and create pseudo-module if so */
+/* Check if host update is available and create pseudo-module if so.
+ * On-device host updates are disabled — they extract as ableton and
+ * silently fail post-update.sh's privileged writes, leaving users
+ * with stale /usr/lib/schwung-shim.so. Direct users to the web manager
+ * (move.local:7700) which runs as root and can complete the install. */
 function getHostUpdateModule() {
-    if (!storeCatalog || !storeCatalog.host) return null;
-    const host = storeCatalog.host;
-    if (!host.latest_version || !host.download_url) return null;
-    if (!isNewerVersion(host.latest_version, storeHostVersion)) return null;
+    return null;
+}
+
+/* Run detection + show a result screen listing what's outdated, with the
+ * web-manager pointer. No install actions — those only happen via the
+ * web manager. checkForUpdatesInBackground populates pendingUpdates as
+ * a side effect; we read length, then never touch the install flow. */
+function showUpdatesAvailableScreen() {
+    announce("Checking for updates");
+    checkForUpdatesInBackground();
+
+    /* Distinguish host pointer from module updates so the user knows
+     * what's actually outdated. checkForUpdatesInBackground pushes a
+     * single _hostPointer entry to the queue when the catalog has a
+     * newer host; everything else is a module update. */
+    let hostNewer = '';
+    let moduleCount = 0;
+    for (let i = 0; i < pendingUpdates.length; i++) {
+        const upd = pendingUpdates[i];
+        if (upd._hostPointer) {
+            hostNewer = upd.to || '';
+        } else {
+            moduleCount++;
+        }
+    }
+
+    /* Reset so the dead UPDATE_PROMPT view isn't shown if the user lands
+     * here a second time without clearing state. */
+    pendingUpdates = [];
+    pendingUpdateIndex = 0;
+    /* Route the result-screen click back to GLOBAL_SETTINGS (not the
+     * empty STORE_PICKER_CATEGORIES "no modules available" fallback). */
+    storePickerFromSettings = false;
+    storeReturnView = VIEWS.GLOBAL_SETTINGS;
+
+    storePickerResultTitle = 'Updates';
+    if (!hostNewer && moduleCount === 0) {
+        storePickerMessage = buildNoUpdatesMessage();
+    } else {
+        const lines = [];
+        if (hostNewer) {
+            lines.push('Schwung ' + hostNewer + ' available');
+        }
+        if (moduleCount > 0) {
+            lines.push(moduleCount + ' module update' + (moduleCount === 1 ? '' : 's'));
+        }
+        lines.push('Update at');
+        lines.push('http://move.local:7700');
+        storePickerMessage = lines.join('\n');
+    }
+    view = VIEWS.STORE_PICKER_RESULT;
+    needsRedraw = true;
+    announce(storePickerMessage);
+}
+
+/* Detect whether the live entrypoint at /opt/move/Move includes the
+ * boot-time `schwung-heal` invocation. If not, the self-heal mechanism
+ * isn't running on this device, /usr/lib/schwung-shim.so will silently
+ * drift out of sync with /data after web-manager updates, and the user
+ * needs the one-time bootstrap (web manager, GUI installer, or SSH).
+ *
+ * Reads the entrypoint via std.loadFile (it's a ~4KB shell script).
+ * Returns true when the bootstrap is missing, false when it's present
+ * or the file can't be read (in which case we don't want to nag). */
+function detectShimBootstrapNeeded() {
+    try {
+        const entry = std.loadFile('/opt/move/Move');
+        if (!entry) return false;
+        return entry.indexOf('schwung-heal') < 0;
+    } catch (_e) {
+        return false;
+    }
+}
+
+/* Pointer to the web manager — same routing semantics as the updates
+ * screen: result-click returns to GLOBAL_SETTINGS via storeReturnView. */
+function showModuleStorePointer() {
+    storePickerFromSettings = false;
+    storeReturnView = VIEWS.GLOBAL_SETTINGS;
+    storePickerResultTitle = 'Module Store';
+    storePickerMessage = 'Module store available at\nhttp://move.local:7700';
+    view = VIEWS.STORE_PICKER_RESULT;
+    needsRedraw = true;
+    announce(storePickerMessage);
+}
+
+/* Return a no-updates message that surfaces "host updates live in the
+ * web manager" when the catalog says a newer host is available. Hiding
+ * the on-device action without telling users where to update otherwise
+ * leaves them silently stuck on old versions. */
+function buildNoUpdatesMessage() {
+    try {
+        if (storeCatalog && storeCatalog.host && storeCatalog.host.latest_version) {
+            const cur = storeHostVersion || getHostVersion();
+            if (isNewerVersion(storeCatalog.host.latest_version, cur)) {
+                return 'Schwung ' + storeCatalog.host.latest_version + ' available\n' +
+                       'Update Schwung at\n' +
+                       'http://move.local:7700';
+            }
+        }
+    } catch (_e) { /* fall through */ }
+    return 'No updates available';
+}
+
+/* On-device host updates are disabled. Surface a clear instruction to
+ * users so they know where to update from instead. */
+function performCoreUpdate(_mod) {
     return {
-        id: "__core_update__",
-        name: "Core Update",
-        description: "Update Schwung core",
-        latest_version: host.latest_version,
-        download_url: host.download_url,
-        component_type: "core",
-        _isHostUpdate: true
+        success: false,
+        error: 'Update Schwung at\nhttp://move.local:7700'
     };
 }
 
-/* Perform a staged core update with verification and backup.
- * Returns { success: bool, error: string? } */
-function performCoreUpdate(mod) {
+/* Legacy implementation kept for reference / future re-enable path —
+ * disabled because the privileged setup post-extract (see post-update.sh
+ * /usr/lib/ + /opt/move/ writes) cannot run as ableton on-device. The
+ * only reliable on-device upgrade path requires root, which the JS layer
+ * doesn't have. */
+function performCoreUpdate_disabled(mod) {
     const BASE = '/data/UserData/schwung';
     const TMP = BASE + '/tmp';
     const STAGING = BASE + '/update-staging';
@@ -1239,23 +1403,13 @@ function checkForUpdatesInBackground() {
     drawStatusOverlay('Updates', 'Checking...');
     host_flush_display();
 
-    /* Check core update */
+    /* Refresh host version (still needed for module compatibility checks).
+     * Core updates are no longer offered on-device — users update via the
+     * web manager (move.local:7700). The check is suppressed so the
+     * "Update All" flow doesn't try to perform a core upgrade that the
+     * JS layer can't complete with the right privileges. */
     storeHostVersion = getHostVersion();
     debugLog("checkForUpdatesInBackground: hostVersion=" + storeHostVersion);
-    const coreRelease = fetchReleaseJsonQuick('charlesvestal/schwung');
-    debugLog("checkForUpdatesInBackground: coreRelease=" + JSON.stringify(coreRelease));
-    if (coreRelease && isNewerVersion(coreRelease.version, storeHostVersion)) {
-        debugLog("checkForUpdatesInBackground: core update available " + storeHostVersion + " -> " + coreRelease.version);
-        updates.push({
-            id: '__core_update__',
-            name: 'Core',
-            from: storeHostVersion,
-            to: coreRelease.version,
-            _isHostUpdate: true,
-            download_url: coreRelease.download_url,
-            latest_version: coreRelease.version
-        });
-    }
 
     /* Check module updates */
     clear_screen();
@@ -1270,6 +1424,26 @@ function checkForUpdatesInBackground() {
     });
     debugLog("checkForUpdatesInBackground: catalog success=" + catalogResult.success);
     if (catalogResult.success) {
+        /* Cache catalog so buildNoUpdatesMessage can read host.latest_version
+         * when there are no module updates — otherwise users hitting Check
+         * for Updates have no signal that a host upgrade is available. */
+        storeCatalog = catalogResult.catalog;
+        /* Surface a non-actionable "Schwung X.Y.Z available" pointer at the
+         * top of the update prompt when the catalog has a newer host. We
+         * can't perform host upgrades on-device (privileged paths blocked
+         * for ableton), so this is informational — selecting it shows the
+         * web manager pointer message and Update All skips it entirely. */
+        const cat = catalogResult.catalog;
+        if (cat && cat.host && cat.host.latest_version &&
+            isNewerVersion(cat.host.latest_version, storeHostVersion)) {
+            updates.push({
+                id: '__host_pointer__',
+                name: 'Schwung ' + cat.host.latest_version,
+                from: storeHostVersion,
+                to: cat.host.latest_version,
+                _hostPointer: true
+            });
+        }
         for (const mod of catalogResult.catalog.modules || []) {
             const status = getModuleStatus(mod, installed);
             if (status.installed && status.hasUpdate) {
@@ -1304,8 +1478,15 @@ function processAllUpdates() {
     let moduleCount = 0;
     const total = pendingUpdates.length;
 
+    let pointerSeen = false;
     for (let i = 0; i < pendingUpdates.length; i++) {
         const upd = pendingUpdates[i];
+
+        /* Host pointer is informational only — skip during Update All. */
+        if (upd._hostPointer) {
+            pointerSeen = true;
+            continue;
+        }
 
         /* Show progress overlay */
         const progressLabel = (i + 1) + '/' + total + ': ' + (upd.name || upd.id || 'update');
@@ -1347,7 +1528,19 @@ function processAllUpdates() {
     } else if (moduleCount > 0) {
         storeInstalledModules = scanInstalledModules();
         storePickerResultTitle = 'Updates';
-        storePickerMessage = 'Updated ' + moduleCount + ' module' + (moduleCount > 1 ? 's' : '');
+        let msg = 'Updated ' + moduleCount + ' module' + (moduleCount > 1 ? 's' : '');
+        if (pointerSeen) {
+            msg += '\nUpdate Schwung at\nhttp://move.local:7700';
+        }
+        storePickerMessage = msg;
+        view = VIEWS.STORE_PICKER_RESULT;
+        needsRedraw = true;
+        announce(storePickerMessage);
+    } else if (pointerSeen) {
+        /* Only the host pointer was in the queue — treat as no-op + show
+         * the web-manager pointer message. */
+        storePickerResultTitle = 'Updates';
+        storePickerMessage = 'Update Schwung at\nhttp://move.local:7700';
         view = VIEWS.STORE_PICKER_RESULT;
         needsRedraw = true;
         announce(storePickerMessage);
@@ -1489,6 +1682,34 @@ let hierEditorEditMode = false;   // true when editing a param value
 let hierEditorEditKey = "";       // full key currently being edited
 let hierEditorEditValue = null;   // stable value during edit mode
 let hierEditorChainParams = [];   // metadata from chain_params
+
+/* Knob state per fullKey for acceleration continuity across consecutive jog turns. */
+const hierKnobStates = new Map();
+function getHierKnobState(fullKey, currentValue) {
+    let st = hierKnobStates.get(fullKey);
+    if (!st) {
+        st = knobInit(currentValue);
+        hierKnobStates.set(fullKey, st);
+    } else {
+        st.value = currentValue;
+    }
+    return st;
+}
+function clearHierKnobStates() { hierKnobStates.clear(); }
+
+/* Knob state per fullKey for the PHYSICAL knobs 1-8 (separate from jog edit mode). */
+const physKnobStates = new Map();
+function getPhysKnobState(fullKey, currentValue) {
+    let st = physKnobStates.get(fullKey);
+    if (!st) {
+        st = knobInit(currentValue);
+        physKnobStates.set(fullKey, st);
+    } else {
+        st.value = currentValue;
+    }
+    return st;
+}
+function clearPhysKnobStates() { physKnobStates.clear(); }
 
 /* Master FX flag - when true, exit returns to MASTER_FX view instead of CHAIN_EDIT */
 let hierEditorIsMasterFx = false;
@@ -2628,9 +2849,7 @@ function exitOvertakeMode() {
     deactivateLedQueue();
 
     /* Unload overtake DSP if loaded */
-    if (typeof shadow_set_param === "function") {
-        shadow_set_param(0, "overtake_dsp:unload", "1");
-    }
+    unloadOvertakeDsp();
     delete globalThis.host_module_set_param;
     delete globalThis.host_module_set_param_blocking;
     delete globalThis.host_module_get_param;
@@ -2701,14 +2920,18 @@ function suspendOvertakeMode() {
         for (let k = 0; k < NUM_KNOBS; k++) overtakeKnobDelta[k] = 0;
         overtakeJogDelta = 0;
 
-        /* Park this module in the suspended map. Callbacks stay alive via closure. */
+        /* Park this module in the suspended map. Callbacks stay alive via closure.
+         * Stash dspPath so resume can detect "another tool clobbered slot 0" and
+         * reload the DSP (Bug C, 2026-05-04). */
         suspendedOvertakes[overtakeModuleId] = {
             id: overtakeModuleId,
             path: overtakeModulePath,
             callbacks: overtakeModuleCallbacks,
             ledNotes: ledNotesSnapshot,
-            ledCCs: ledCCsSnapshot
+            ledCCs: ledCCsSnapshot,
+            dspPath: currentSlot0DspPath
         };
+        lastSuspendedToolId = overtakeModuleId;
 
         /* Clear active-module state so a different module can be loaded next. */
         overtakeModuleLoaded = false;
@@ -2795,7 +3018,18 @@ function resumeOvertakeModule(moduleId) {
     if (parked.ledNotes) Object.assign(ledQueueNotes, parked.ledNotes);
     if (parked.ledCCs) Object.assign(ledQueueCCs, parked.ledCCs);
 
+    /* Bug C fix: slot-0 overtake DSP is single-tenant. If another tool loaded
+     * its DSP since we suspended, ours got destroyed — reload before the JS
+     * module starts polling host_module_get_param against a dead/wrong DSP. */
+    if (parked.dspPath && parked.dspPath !== currentSlot0DspPath) {
+        debugLog("resumeOvertakeModule: slot 0 DSP mismatch (current=" +
+                 (currentSlot0DspPath || "(empty)") + " parked=" + parked.dspPath +
+                 ") — reloading DSP");
+        loadOvertakeDsp(parked.dspPath);
+    }
+
     delete suspendedOvertakes[moduleId];
+    if (lastSuspendedToolId === moduleId) lastSuspendedToolId = "";
 
     if (typeof shadow_set_suspend_overtake === "function") {
         shadow_set_suspend_overtake(0);
@@ -2822,8 +3056,30 @@ function exitToolOvertake() {
     deactivateLedQueue();
 
     /* Unload overtake DSP */
-    if (typeof shadow_set_param === "function") {
-        shadow_set_param(0, "overtake_dsp:unload", "1");
+    unloadOvertakeDsp();
+
+    /* Evict any parked suspend_keeps_js modules. Their DSP was already
+     * unloaded when *this* foreground module loaded its own (the shim
+     * has only one overtake_dsp slot — see schwung_shim.c:1284-1296),
+     * so they're talking to nothing. Worse, we're about to delete the
+     * host_module_set_param/get_param shims below; if we leave parked
+     * entries in place the parked-tick loop (see ~line 13745) keeps
+     * calling their tick() into deleted globals — silent set-failures
+     * and 100% null get-reads, indefinitely. Fully unload them now. */
+    var parkedIds = Object.keys(suspendedOvertakes);
+    for (var pi = 0; pi < parkedIds.length; pi++) {
+        var pid = parkedIds[pi];
+        var parked = suspendedOvertakes[pid];
+        if (parked && parked.callbacks) {
+            invokeModuleOnUnload(parked.callbacks, pid);
+        }
+        delete suspendedOvertakes[pid];
+    }
+    if (parkedIds.length > 0) {
+        debugLog("exitToolOvertake: evicted " + parkedIds.length + " parked module(s): " + parkedIds.join(","));
+        if (lastSuspendedToolId && parkedIds.indexOf(lastSuspendedToolId) >= 0) {
+            lastSuspendedToolId = "";
+        }
     }
 
     /* Clean up shims */
@@ -3016,7 +3272,7 @@ function loadOvertakeModule(moduleInfo, skipOvertake) {
         if (moduleInfo.dsp && typeof shadow_set_param === "function") {
             const dspPath = moduleInfo.basePath + "/" + moduleInfo.dsp;
             debugLog("loadOvertakeModule: loading DSP from " + dspPath);
-            shadow_set_param(0, "overtake_dsp:load", dspPath);
+            loadOvertakeDsp(dspPath);
         }
 
         /* Step 3: Install host_module_set_param / host_module_get_param shims BEFORE
@@ -3101,9 +3357,7 @@ function loadOvertakeModule(moduleInfo, skipOvertake) {
                 overtakeModuleCallbacks = null;
                 delete globalThis.host_module_set_param;
                 delete globalThis.host_module_get_param;
-                if (typeof shadow_set_param === "function") {
-                    shadow_set_param(0, "overtake_dsp:unload", "1");
-                }
+                unloadOvertakeDsp();
                 if (typeof shadow_set_overtake_mode === "function") {
                     shadow_set_overtake_mode(0);
                 }
@@ -3185,9 +3439,7 @@ function loadOvertakeModule(moduleInfo, skipOvertake) {
         overtakeModuleLoaded = false;
         overtakeModuleCallbacks = null;
         /* Clean up DSP and param shims on error */
-        if (typeof shadow_set_param === "function") {
-            shadow_set_param(0, "overtake_dsp:unload", "1");
-        }
+        unloadOvertakeDsp();
         delete globalThis.host_module_set_param;
         delete globalThis.host_module_get_param;
         delete globalThis.host_exit_module;
@@ -3939,19 +4191,19 @@ function autosaveAllSlots() {
         const hasFx2 = cfg && cfg.fx2 && cfg.fx2.module;
         const hasMidiFx = cfg && cfg.midiFx && cfg.midiFx.module;
         if (!hasSynth && !hasFx1 && !hasFx2 && !hasMidiFx) {
-            /* Cross-check before clobbering: if the user has a preset
-             * assigned to this slot (slots[i].name non-empty) but the shim
-             * is currently reporting "no modules", that's a shim-side
-             * glitch (e.g. boot-time patch load failure for slot 3 we
-             * diagnosed 2026-04-18) — NOT a real "user removed the chain"
-             * action. Preserve the existing slot_N.json so the next boot
-             * has a chance to reload it. Without this guard, one transient
-             * load failure permanently erases the user's preset assignment.
+            /* Cross-check before clobbering: if the slot has a preset name
+             * but the shim is reporting "no modules" AND the user did not
+             * explicitly clear the slot via the picker, it's a transient
+             * shim-side glitch (e.g. boot-time patch load failure
+             * diagnosed 2026-04-18). Preserve the existing slot_N.json so
+             * the next boot has a chance to reload it.
              *
-             * Only write the empty marker when both shim and shadow_ui's
-             * in-memory slot name agree the slot is empty. */
+             * slotUserCleared[i] = true means the user picked None for
+             * every component in the slot, so the empty state is real and
+             * must be persisted (otherwise removals never save — diagnosed
+             * 2026-04-29). */
             const slotName = (slots[i] && slots[i].name) || "";
-            if (slotName !== "") {
+            if (!slotUserCleared[i] && slotName !== "") {
                 debugLog("autosave: slot " + i + " shim reports empty but " +
                          "preset name=\"" + slotName + "\" — preserving " +
                          "existing slot_" + i + ".json (likely shim glitch)");
@@ -3964,6 +4216,7 @@ function autosaveAllSlots() {
                 "{}\n"
             );
             slotDirtyCache[i] = false;
+            slotUserCleared[i] = false;
             continue;
         }
 
@@ -4484,19 +4737,11 @@ function handleMasterFxSettingsAction(key) {
         announceSavePreview(masterPendingSaveName, masterNamePreviewIndex);
         needsRedraw = true;
     } else if (key === "check_updates") {
-        /* Check for updates now */
-        checkForUpdatesInBackground();
-        if (pendingUpdates.length === 0) {
-            /* No updates found — show a brief message via store result view */
-            storePickerResultTitle = 'Updates';
-            storePickerMessage = 'No updates available';
-            view = VIEWS.STORE_PICKER_RESULT;
-            needsRedraw = true;
-        }
-        /* If updates found, checkForUpdatesInBackground already set view to UPDATE_PROMPT */
+        /* Detection only — no install actions on-device. */
+        showUpdatesAvailableScreen();
     } else if (key === "module_store") {
-        /* Open full module store with category browser */
-        enterStoreFromSettings();
+        /* Browsing on-device is disabled — point at the web manager. */
+        showModuleStorePointer();
     } else if (key === "delete") {
         /* Delete - confirm */
         masterConfirmingDelete = true;
@@ -4574,6 +4819,44 @@ function generateNewFilePath(dir) {
     const exts = (toolActiveTool && toolActiveTool.tool_config && toolActiveTool.tool_config.input_extensions) || [".wav"];
     const ext = Array.isArray(exts) ? exts[0] : exts;
     return dir + "/New_" + stamp + ext;
+}
+
+/* Launch a tool from the tools menu after the feedback gate has run (or
+ * been bypassed when the tool has no id). Mirrors the original VIEWS.TOOLS
+ * select dispatch — every launch path (overtake / set_picker /
+ * skip_file_browser+interactive / file browser / standalone / fallback)
+ * must be preserved here. */
+function launchToolConfirmed(tool) {
+    /* Track tool selection. Overtake tools are tracked inside
+     * loadOvertakeModule → skip here to avoid a double event. */
+    if (tool.kind !== 'overtake' && typeof host_track_event === "function" && tool.id) {
+        host_track_event('module_loaded', '"module_id":"' + tool.id + '","source":"tools"');
+    }
+    if (tool.kind === 'overtake') {
+        debugLog("TOOLS SELECT overtake: " + tool.id);
+        announce(`Loading ${tool.name || tool.id}`);
+        loadOvertakeModule(tool);
+        return;
+    }
+    debugLog("TOOLS SELECT tool: " + tool.id + " config=" + JSON.stringify(tool.tool_config));
+    if (tool.tool_config && tool.tool_config.set_picker) {
+        debugLog("TOOLS SELECT: entering set picker");
+        enterToolSetPicker(tool);
+    } else if (tool.tool_config && tool.tool_config.skip_file_browser && tool.tool_config.interactive) {
+        debugLog("TOOLS SELECT: skip_file_browser, launching interactive directly");
+        startInteractiveTool(tool, "");
+    } else if (tool.tool_config && (tool.tool_config.command || tool.tool_config.interactive || tool.tool_config.engines)) {
+        debugLog("TOOLS SELECT: entering file browser");
+        enterToolFileBrowser(tool);
+    } else if (tool.standalone) {
+        debugLog("TOOLS SELECT: launching standalone binary");
+        announce(`Launching ${tool.name}`);
+        const binaryPath = tool.path + "/standalone";
+        host_system_cmd("sh /data/UserData/schwung/launch-standalone.sh " + binaryPath);
+    } else {
+        debugLog("TOOLS SELECT: tool not available");
+        announce("Tool not available");
+    }
 }
 
 function enterToolFileBrowser(toolModule) {
@@ -4963,9 +5246,7 @@ function startInteractiveTool(toolModule, filePath) {
             debugLog("startInteractiveTool: different file, discarding hidden session");
             /* DSP may already be unloaded if another tool ran since hide */
             if (overtakeModuleLoaded) {
-                if (typeof shadow_set_param === "function") {
-                    shadow_set_param(0, "overtake_dsp:unload", "1");
-                }
+                unloadOvertakeDsp();
             }
             overtakeModuleLoaded = false;
             overtakeModulePath = "";
@@ -5325,21 +5606,11 @@ function handleGlobalSettingsAction(key) {
     }
     if (key === "check_updates") {
         storeReturnView = VIEWS.GLOBAL_SETTINGS;
-        announce("Checking for updates");
-        checkForUpdatesInBackground();
-        if (pendingUpdates.length === 0) {
-            storePickerResultTitle = 'Updates';
-            storePickerMessage = 'No updates available';
-            view = VIEWS.STORE_PICKER_RESULT;
-            needsRedraw = true;
-            announce("No updates available");
-        }
-        /* If updates found, checkForUpdatesInBackground already announced */
+        showUpdatesAvailableScreen();
         return;
     }
     if (key === "module_store") {
-        storeReturnView = VIEWS.GLOBAL_SETTINGS;
-        enterStoreFromSettings();
+        showModuleStorePointer();
         return;
     }
 }
@@ -5816,6 +6087,17 @@ function syncSettingsFromConfigFile() {
             const cur = typeof set_pages_get === "function" ? !!set_pages_get() : true;
             if (!!c.set_pages_enabled !== cur) set_pages_set_shm(c.set_pages_enabled ? 1 : 0);
         }
+        /* Shadow UI trigger (Long Press / Shift+Vol / Both) */
+        if (c.shadow_ui_trigger !== undefined && typeof shadow_ui_trigger_set_shm === "function") {
+            const map = { long_press: 0, shift_vol: 1, both: 2 };
+            let val = (typeof c.shadow_ui_trigger === "number")
+                ? c.shadow_ui_trigger
+                : map[c.shadow_ui_trigger];
+            if (typeof val === "number" && val >= 0 && val <= 2) {
+                const cur = typeof shadow_ui_trigger_get === "function" ? shadow_ui_trigger_get() : 2;
+                if (val !== cur) shadow_ui_trigger_set_shm(val);
+            }
+        }
         /* Auto update check */
         if (c.auto_update_check !== undefined) {
             autoUpdateCheckEnabled = c.auto_update_check;
@@ -6087,45 +6369,33 @@ function componentKeyToCategoryId(componentKey) {
     }
 }
 
-/* Enter the store picker for a specific component type */
+/* Enter the store picker for a specific component type — disabled.
+ *
+ * Was the gateway from "[Get more...]" entries in the overtake / master FX
+ * / chain component module pickers into the on-device store browser. The
+ * browser flow ended in installs/updates that silently failed for users
+ * without root, so we redirect every "Get more" tap straight at the web
+ * manager pointer screen — same destination as Settings → Module Store.
+ *
+ * Preserves the entry-context flags (storePickerFromOvertake /
+ * storePickerFromMasterFx / storePickerCategory) so the result-screen
+ * jog-click can return to wherever the user came from instead of dumping
+ * them on Global Settings or the empty STORE_PICKER_LIST. */
 function enterStorePicker(componentKey) {
     const categoryId = componentKeyToCategoryId(componentKey);
     if (!categoryId) return;
 
     storePickerCategory = categoryId;
-    storePickerSelectedIndex = 0;
     storePickerCurrentModule = null;
-    storePickerActionIndex = 0;
-    storePickerResultTitle = '';  /* Reset to default 'Module Store' */
     storePickerFromOvertake = (componentKey === 'overtake');
     storePickerFromMasterFx = (componentKey === 'master_fx');
+    storePickerFromSettings = false;
 
-    /* Check if we need to fetch catalog */
-    if (!storeCatalog) {
-        setView(VIEWS.STORE_PICKER_LOADING);
-        storePickerLoadingTitle = 'Module Store';
-        storePickerLoadingMessage = 'Loading catalog...';
-        announce("Loading catalog");
-        needsRedraw = true;
-
-        /* Fetch catalog (blocking) */
-        fetchStoreCatalogSync();
-        /* Force display update after catalog load */
-        needsRedraw = true;
-    } else {
-        /* Catalog already loaded, go to list */
-        storePickerModules = getModulesForCategory(storeCatalog, categoryId);
-        setView(VIEWS.STORE_PICKER_LIST);
-        needsRedraw = true;
-        /* Announce menu title + initial selection with status */
-        if (storePickerModules.length > 0) {
-            const module = storePickerModules[0];
-            const statusLabel = getStoreModuleStatusLabel(module);
-            announce(`Module Store, ${module.name}` + (statusLabel ? `, ${statusLabel}` : ""));
-        } else {
-            announce("Module Store, No modules available");
-        }
-    }
+    storePickerResultTitle = 'Module Store';
+    storePickerMessage = 'Module store available at\nhttp://move.local:7700';
+    setView(VIEWS.STORE_PICKER_RESULT);
+    needsRedraw = true;
+    announce(storePickerMessage);
 }
 
 /* Fetch catalog synchronously (blocking) */
@@ -6225,14 +6495,17 @@ function buildStoreCategoryItems() {
     storeHostVersion = getHostVersion();
     storeInstalledModules = scanInstalledModules();
 
-    /* Core update at top if available */
-    const hostUpdate = getHostUpdateModule();
-    if (hostUpdate) {
+    /* Core update at top if available — disabled on-device, but if catalog
+     * has a newer host we still surface a non-actionable info row pointing
+     * users at the web manager. Otherwise they have no signal that they're
+     * out of date. */
+    if (storeCatalog && storeCatalog.host && storeCatalog.host.latest_version &&
+        isNewerVersion(storeCatalog.host.latest_version, storeHostVersion)) {
         storeCategoryItems.push({
-            id: '__host_update__',
-            label: 'Update Host',
-            value: storeHostVersion + ' -> ' + hostUpdate.latest_version,
-            _hostUpdate: hostUpdate
+            id: '__host_update_info__',
+            label: 'Schwung ' + storeCatalog.host.latest_version + ' available',
+            value: 'move.local:7700',
+            _info: true
         });
     }
 
@@ -6294,6 +6567,18 @@ function handleStoreCategorySelect() {
         storePickerActionIndex = 0;
         setView(VIEWS.STORE_PICKER_DETAIL);
         announce("Core Update, " + storeHostVersion + " to " + item._hostUpdate.latest_version);
+        needsRedraw = true;
+        return;
+    }
+
+    if (item.id === '__host_update_info__') {
+        /* Info-only entry: tell the user to update from the web manager.
+         * On-device host updates can't write the privileged paths required
+         * to actually swap the live shim. */
+        storePickerResultTitle = 'Update Schwung';
+        storePickerMessage = 'Update Schwung at\nhttp://move.local:7700';
+        setView(VIEWS.STORE_PICKER_RESULT);
+        announce(storePickerMessage);
         needsRedraw = true;
         return;
     }
@@ -6458,9 +6743,51 @@ function handleStorePickerDetailSelect() {
 
 /* Handle selection in store picker result */
 function handleStorePickerResultSelect() {
-    /* Return to list */
-    setView(VIEWS.STORE_PICKER_LIST);
+    /* Honor the entry-context flags so dismissing the pointer screen
+     * sends the user back to wherever they came from. These mirror
+     * handleStorePickerBack's STORE_PICKER_LIST dispatch — the only
+     * reason the back-button and click-dismiss diverged historically
+     * is that the result screen used to terminate install flows that
+     * could only sensibly return to the module list. With the install
+     * paths gone, every result screen is informational, and dismiss
+     * should round-trip to the entry context. */
     storePickerCurrentModule = null;
+
+    if (storeReturnView === VIEWS.GLOBAL_SETTINGS) {
+        storeReturnView = null;
+        enterGlobalSettings();
+        return;
+    }
+    if (storePickerFromOvertake) {
+        overtakeModules = scanForOvertakeModules();
+        setView(VIEWS.OVERTAKE_MENU);
+        storePickerFromOvertake = false;
+        storeCatalog = null;
+        storePickerCategory = null;
+        storePickerModules = [];
+        return;
+    }
+    if (storePickerFromMasterFx) {
+        MASTER_FX_OPTIONS = scanForAudioFxModules();
+        enterMasterFxModuleSelect(selectedMasterFxComponent);
+        setView(VIEWS.MASTER_FX);
+        storePickerFromMasterFx = false;
+        storeCatalog = null;
+        storePickerCategory = null;
+        storePickerModules = [];
+        return;
+    }
+    if (storePickerCategory) {
+        /* Came from the chain component picker. */
+        availableModules = scanModulesForType(CHAIN_COMPONENTS[selectedChainComponent].key);
+        setView(VIEWS.COMPONENT_SELECT);
+        storeCatalog = null;
+        storePickerCategory = null;
+        storePickerModules = [];
+        return;
+    }
+    /* Last-resort fallback (legacy callers). */
+    setView(VIEWS.STORE_PICKER_LIST);
     needsRedraw = true;
 }
 
@@ -6645,6 +6972,12 @@ function applyComponentSelection() {
     }
     chainConfigs[selectedSlot] = cfg;
 
+    /* Track explicit user-removal so autosave can bypass the boot-glitch
+     * guard. Set when the slot is now fully empty; reset on any non-empty
+     * pick (the user is rebuilding the slot). */
+    slotUserCleared[selectedSlot] =
+        !cfg.synth && !cfg.fx1 && !cfg.fx2 && !cfg.midiFx;
+
     /* Apply to DSP - map component key to param key */
     const moduleId = selected && selected.id ? selected.id : "";
     let paramKey = "";
@@ -6663,9 +6996,45 @@ function applyComponentSelection() {
             break;
     }
 
+    /* Feedback gate: if the picked module pulls line-in, warn about speakers.
+     * Callback-based — schwung's QuickJS doesn't pump pending jobs so
+     * Promise.then never fires. */
+    if (paramKey && moduleId) {
+        const slotIndex = selectedSlot;  /* capture — shim JUMP_TO_SLOT path can mutate selectedSlot */
+        let meta = null;
+        try {
+            if (typeof host_get_module_metadata === 'function') {
+                meta = host_get_module_metadata(moduleId);
+            }
+        } catch (err) {
+            if (typeof host_log === 'function') {
+                host_log(`applyComponentSelection: feedback gate metadata error for ${moduleId}: ${err}`);
+            }
+        }
+        maybeConfirmForModule(meta, (ok) => {
+            if (!ok) {
+                if (typeof host_log === 'function') {
+                    host_log(`applyComponentSelection: declined feedback gate for ${moduleId}`);
+                }
+                loadChainConfigFromSlot(slotIndex);
+                slotUserCleared[slotIndex] = false;
+                setView(VIEWS.CHAIN_EDIT);
+                needsRedraw = true;
+                return;
+            }
+            applyComponentSelectionConfirmed(slotIndex, paramKey, moduleId, comp);
+        });
+        return;
+    }
+
+    /* Clearing a slot (empty moduleId) — no feedback risk, run directly. */
+    applyComponentSelectionConfirmed(selectedSlot, paramKey, moduleId, comp);
+}
+
+function applyComponentSelectionConfirmed(slotIndex, paramKey, moduleId, comp) {
     if (paramKey) {
-        if (typeof host_log === "function") host_log(`applyComponentSelection: slot=${selectedSlot} param=${paramKey} module=${moduleId}`);
-        const success = setSlotParam(selectedSlot, paramKey, moduleId);
+        if (typeof host_log === "function") host_log(`applyComponentSelection: slot=${slotIndex} param=${paramKey} module=${moduleId}`);
+        const success = setSlotParam(slotIndex, paramKey, moduleId);
         if (typeof host_log === "function") host_log(`applyComponentSelection: setSlotParam returned ${success}`);
         if (!success) {
             print(2, 50, "Failed to apply", 1);
@@ -6682,8 +7051,8 @@ function applyComponentSelection() {
      * Without this, the knob overlay can show the old module's name and params
      * because the periodic refreshSlotModuleSignature (every 30 ticks) hasn't
      * run yet to sync the in-memory state with DSP. */
-    loadChainConfigFromSlot(selectedSlot);
-    lastSlotModuleSignatures[selectedSlot] = getSlotModuleSignature(selectedSlot);
+    loadChainConfigFromSlot(slotIndex);
+    lastSlotModuleSignatures[slotIndex] = getSlotModuleSignature(slotIndex);
     invalidateKnobContextCache();
     setView(VIEWS.CHAIN_EDIT);
     needsRedraw = true;
@@ -7954,49 +8323,16 @@ function getWavPositionSetPrecision(meta) {
 
 /* Format a param value for setting (respects type) */
 function formatParamForSet(val, meta) {
-    if (meta && meta.type === "int") {
-        return Math.round(val).toString();
-    }
     if (meta && meta.ui_type === "wav_position") {
         if (meta.display_unit === "ms") return Math.round(val).toString();
         const precision = getWavPositionSetPrecision(meta);
         return Number(val).toFixed(precision);
     }
-    return val.toFixed(3);
-}
-
-/* Format a param value for overlay display (respects type and range) */
-function applyDisplayFormat(fmt, num, meta) {
-    if (!fmt) return null;
-    /* Support printf-inspired format strings: .4f, .2%, %.2f, etc. */
-    const match = fmt.match(/^%?\.?(\d+)(f|%)$/);
-    if (!match) return null;
-    const decimals = parseInt(match[1]);
-    /* Replicate C-side scaling: if unit is "%" and max <= 1, scale to 0-100 */
-    let displayVal = num;
-    if (meta && meta.unit === "%" && typeof meta.max === "number" && meta.max <= 1) {
-        displayVal = num * 100.0;
-    }
-    if (match[2] === "%") {
-        return (num * 100).toFixed(decimals) + "%";
-    }
-    const formatted = displayVal.toFixed(decimals);
-    /* Append unit suffix if present (matching C-side behavior) */
-    if (meta && meta.unit) return formatted + (meta.unit === "%" ? "%" : " " + meta.unit);
-    return formatted;
+    return ufFormatParamForSet(val, meta);
 }
 
 function formatParamForOverlay(val, meta) {
-    if (meta && meta.type === "int") {
-        return Math.round(val).toString();
-    }
-    /* Enum/bool: show value as-is (string) */
-    if (meta && (meta.type === "enum" || meta.type === "bool")) {
-        if (meta.picker_type && (val === "" || val === null || val === undefined)) {
-            return meta.none_label || "(none)";
-        }
-        return String(formatMetaOptionValue(meta, val));
-    }
+    /* Local-only special cases that param_format.mjs intentionally doesn't know about */
     if (meta && meta.ui_type === "wav_position") {
         return formatWavPositionDisplayValue(val, meta);
     }
@@ -8006,18 +8342,30 @@ function formatParamForOverlay(val, meta) {
     if (meta && meta.type === "canvas") {
         return formatCanvasDisplayValue(val, meta);
     }
-    /* Use display_format if provided by module metadata */
-    if (meta && meta.display_format) {
-        const formatted = applyDisplayFormat(meta.display_format, val, meta);
-        if (formatted !== null) return formatted;
+    /* picker enum with empty value -> none_label */
+    if (meta && (meta.type === "enum" || meta.type === "bool") &&
+        meta.picker_type && (val === "" || val === null || val === undefined)) {
+        return meta.none_label || "(none)";
     }
-    /* Float: show as percentage if 0-1 or 0-2 range */
+    /* enum/bool — go through formatMetaOptionValue (handles index↔label dual format) */
+    if (meta && (meta.type === "enum" || meta.type === "bool")) {
+        return String(formatMetaOptionValue(meta, val));
+    }
+    /* If the param has a unit or display_format, hand off to the shared formatter */
+    if (meta && (meta.unit || meta.display_format)) {
+        return ufFormatParamValue(val, meta);
+    }
+    /* Legacy auto-percent fallback for un-tagged floats in 0..(1..4] range —
+     * preserves visual behavior of un-migrated modules until they declare unit:"%". */
+    if (meta && meta.type === "int") {
+        return Math.round(val).toString();
+    }
     const min = meta && typeof meta.min === "number" ? meta.min : 0;
     const max = meta && typeof meta.max === "number" ? meta.max : 1;
     if (min === 0 && max >= 1 && max <= 4) {
         return Math.round(val * 100) + "%";
     }
-    return val.toFixed(2);
+    return Number(val).toFixed(2);
 }
 
 function getHierarchyLevelDef() {
@@ -8137,20 +8485,18 @@ function adjustHierSelectedParam(delta) {
         return;
     }
 
-    /* Handle numeric types */
+    /* Handle numeric types — jog-click semantics: one declared step per click, no accel. */
     const num = parseFloat(currentVal);
     if (isNaN(num)) return;
 
-    /* Get step from metadata - default 1 for int, 0.02 for float */
     const isInt = meta && meta.type === "int";
-    let step = meta && meta.step ? meta.step : (isInt ? 1 : 0.02);
+    let step = (meta && meta.step > 0) ? meta.step : (isInt ? 1 : 0.01);
     if (meta && meta.ui_type === "wav_position" && isShiftHeld()) {
         const fineStep = Math.abs(step) * getWavPositionShiftMultiplier(meta);
         if (fineStep > 0) step = fineStep;
     }
     const min = meta && typeof meta.min === "number" ? meta.min : 0;
     const max = meta && typeof meta.max === "number" ? meta.max : 1;
-
     const newVal = Math.max(min, Math.min(max, num + delta * step));
     const formatted = formatParamForSet(newVal, meta);
     setSlotParam(hierEditorSlot, fullKey, formatted);
@@ -8575,6 +8921,7 @@ function getKnobCachedValue(knobIndex, ctx) {
 function invalidateKnobValueCache() {
     knobValueCache.fill(null);
     knobValueCacheKey.fill("");
+    clearHierKnobStates();
 }
 
 /*
@@ -8647,9 +8994,17 @@ function processPendingHierKnob() {
                 currentIndex = 0;
             }
         }
-        let newIndex = currentIndex + (delta > 0 ? 1 : -1);
-        if (newIndex < 0) newIndex = 0;
-        if (newIndex >= ctx.meta.options.length) newIndex = ctx.meta.options.length - 1;
+        /* Run through knob_engine so the divisor curve applies — many ticks
+         * required per option change, with the same staleness reset semantics. */
+        const enumCfg = knobConfigFromMeta(ctx.meta);
+        const st = getPhysKnobState(ctx.fullKey, currentIndex);
+        const newIndex = knobTick(st, enumCfg, delta, Date.now());
+        if (newIndex === currentIndex) {
+            /* No option crossed yet — only update the overlay so the user sees
+             * something happening, but DON'T setSlotParam (no value change). */
+            showOverlay(ctx.title, formatMetaOptionValue(ctx.meta, ctx.meta.options[currentIndex]));
+            return;
+        }
         const newVal = ctx.meta.options[newIndex];
         /* Cache the value in the same format the plugin returned (string or index) */
         const pluginUsesIndex = (ctx.meta.options.indexOf(currentVal) < 0);
@@ -8677,23 +9032,15 @@ function processPendingHierKnob() {
     const num = (typeof currentVal === "number") ? currentVal : parseFloat(currentVal);
     if (isNaN(num)) return;
 
-    /* Calculate step and bounds from metadata */
-    const isInt = ctx.meta && ctx.meta.type === "int";
-    const defaultStep = isInt ? KNOB_BASE_STEP_INT : KNOB_BASE_STEP_FLOAT;
-    const baseStep = ctx.meta && ctx.meta.step ? ctx.meta.step : defaultStep;
-    const min = ctx.meta && typeof ctx.meta.min === "number" ? ctx.meta.min : 0;
-    const max = ctx.meta && typeof ctx.meta.max === "number" ? ctx.meta.max : 1;
-
-    /* Shift provides fine control for wav_position editing. */
-    const fineWavEdit = !!(ctx.meta && ctx.meta.ui_type === "wav_position" && isShiftHeld());
-    const accel = fineWavEdit ? 1 : calcKnobAccel(knobIndex, isInt);
-
-    /* Apply accumulated delta with acceleration and clamp */
-    const fineStep = Math.abs(baseStep) * getWavPositionShiftMultiplier(ctx.meta);
-    const step = fineWavEdit
-        ? (fineStep > 0 ? fineStep : baseStep)
-        : (baseStep * accel);
-    const newVal = Math.max(min, Math.min(max, num + delta * step));
+    /* Build knob config from meta. */
+    const knobCfg = knobConfigFromMeta(ctx.meta);
+    /* Shift fine-step override for wav_position. */
+    if (ctx.meta && ctx.meta.ui_type === "wav_position" && isShiftHeld()) {
+        const fineStep = Math.abs(knobCfg.step) * getWavPositionShiftMultiplier(ctx.meta);
+        if (fineStep > 0) knobCfg.step = fineStep;
+    }
+    const st = getPhysKnobState(ctx.fullKey, num);
+    const newVal = knobTick(st, knobCfg, delta, Date.now());
 
     /* Update local cache — no IPC read needed on next turn */
     knobValueCache[knobIndex] = newVal;
@@ -8749,10 +9096,9 @@ function formatHierDisplayValue(key, val) {
     const num = parseFloat(val);
     if (isNaN(num)) return val;
 
-    /* Use display_format if provided by module metadata */
-    if (meta && meta.display_format) {
-        const formatted = applyDisplayFormat(meta.display_format, num, meta);
-        if (formatted !== null) return formatted;
+    /* Unit or display_format → unified formatter (handles "440.00 Hz", "5.0 ms", etc.) */
+    if (meta && (meta.unit || meta.display_format)) {
+        return ufFormatParamValue(num, meta);
     }
 
     /* Show as percentage for 0-1 float values */
@@ -10153,6 +10499,11 @@ function getMasterFxSettingValue(setting) {
     if (setting.key === "set_pages_enabled") {
         return (typeof set_pages_get === "function" && set_pages_get()) ? "On" : "Off";
     }
+    if (setting.key === "shadow_ui_trigger") {
+        const val = typeof shadow_ui_trigger_get === "function" ? shadow_ui_trigger_get() : 2;
+        const labels = (setting && Array.isArray(setting.options)) ? setting.options : ["Long Press", "Shift+Vol", "Both"];
+        return labels[val] || labels[2] || "Both";
+    }
     if (setting.key === "skipback_shortcut") {
         const val = typeof skipback_shortcut_get === "function" ? (skipback_shortcut_get() ? 1 : 0) : 0;
         return ["Sh+Cap", "Sh+Vol+Cap"][val] || "Sh+Cap";
@@ -10300,6 +10651,19 @@ function adjustMasterFxSetting(setting, delta) {
     if (setting.key === "set_pages_enabled" && typeof set_pages_set === "function") {
         const current = typeof set_pages_get === "function" ? set_pages_get() : true;
         set_pages_set(!current ? 1 : 0);
+        return;
+    }
+
+    if (setting.key === "shadow_ui_trigger") {
+        if (typeof shadow_ui_trigger_set !== "function") return;
+        const current = typeof shadow_ui_trigger_get === "function" ? shadow_ui_trigger_get() : 2;
+        const values = (setting && Array.isArray(setting.values) && setting.values.length > 0)
+            ? setting.values
+            : [0, 1, 2];
+        let idx = values.indexOf(current);
+        if (idx < 0) idx = values.length - 1;
+        const nextIdx = (idx + (delta > 0 ? 1 : values.length - 1)) % values.length;
+        shadow_ui_trigger_set(values[nextIdx]);
         return;
     }
 
@@ -10703,7 +11067,8 @@ function handleJog(delta) {
             }
             toolsMenuIndex = idx;
             if (toolModules.length > 0 && toolModules[toolsMenuIndex]?.type !== 'divider') {
-                announce(toolModules[toolsMenuIndex].name);
+                const item = toolModules[toolsMenuIndex];
+                announce(item.suspended ? (item.name + ", suspended") : item.name);
             }
             break;
         }
@@ -11469,6 +11834,15 @@ function handleSelect() {
                 /* "Update All" - install directly */
                 announce("Installing all updates");
                 processAllUpdates();
+            } else if (pendingUpdateIndex >= 0 && pendingUpdateIndex < pendingUpdates.length &&
+                       pendingUpdates[pendingUpdateIndex]._hostPointer) {
+                /* Host pointer: not actionable on-device; show web manager
+                 * instruction screen instead of the install detail view. */
+                storePickerResultTitle = 'Update Schwung';
+                storePickerMessage = 'Update Schwung at\nhttp://move.local:7700';
+                view = VIEWS.STORE_PICKER_RESULT;
+                needsRedraw = true;
+                announce(storePickerMessage);
             } else if (pendingUpdateIndex >= 0 && pendingUpdateIndex < pendingUpdates.length) {
                 const upd = pendingUpdates[pendingUpdateIndex];
                 updateDetailModule = upd;
@@ -11567,36 +11941,31 @@ function handleSelect() {
             if (toolsMenuIndex >= 0 && toolsMenuIndex < toolModules.length) {
                 const tool = toolModules[toolsMenuIndex];
                 if (tool.type === 'divider') break;
-                /* Track tool selection. Overtake tools are tracked inside
-                 * loadOvertakeModule → skip here to avoid a double event. */
-                if (tool.kind !== 'overtake' && typeof host_track_event === "function" && tool.id) {
-                    host_track_event('module_loaded', '"module_id":"' + tool.id + '","source":"tools"');
-                }
-                if (tool.kind === 'overtake') {
-                    debugLog("TOOLS SELECT overtake: " + tool.id);
-                    announce(`Loading ${tool.name || tool.id}`);
-                    loadOvertakeModule(tool);
+                if (tool.id) {
+                    let meta = null;
+                    try {
+                        if (typeof host_get_module_metadata === 'function') {
+                            meta = host_get_module_metadata(tool.id);
+                        }
+                    } catch (err) {
+                        if (typeof host_log === 'function') {
+                            host_log(`tools: feedback gate metadata error for ${tool.id}: ${err}`);
+                        }
+                    }
+                    maybeConfirmForModule(meta, (ok) => {
+                        if (!ok) {
+                            if (typeof host_log === 'function') {
+                                host_log(`tools: declined feedback gate for ${tool.id}`);
+                            }
+                            needsRedraw = true;
+                            return;
+                        }
+                        launchToolConfirmed(tool);
+                    });
                     break;
                 }
-                debugLog("TOOLS SELECT tool: " + tool.id + " config=" + JSON.stringify(tool.tool_config));
-                if (tool.tool_config && tool.tool_config.set_picker) {
-                    debugLog("TOOLS SELECT: entering set picker");
-                    enterToolSetPicker(tool);
-                } else if (tool.tool_config && tool.tool_config.skip_file_browser && tool.tool_config.interactive) {
-                    debugLog("TOOLS SELECT: skip_file_browser, launching interactive directly");
-                    startInteractiveTool(tool, "");
-                } else if (tool.tool_config && (tool.tool_config.command || tool.tool_config.interactive || tool.tool_config.engines)) {
-                    debugLog("TOOLS SELECT: entering file browser");
-                    enterToolFileBrowser(tool);
-                } else if (tool.standalone) {
-                    debugLog("TOOLS SELECT: launching standalone binary");
-                    announce(`Launching ${tool.name}`);
-                    const binaryPath = tool.path + "/standalone";
-                    host_system_cmd("sh /data/UserData/schwung/launch-standalone.sh " + binaryPath);
-                } else {
-                    debugLog("TOOLS SELECT: tool not available");
-                    announce("Tool not available");
-                }
+                /* No tool.id (shouldn't happen, but defensive): launch directly. */
+                launchToolConfirmed(tool);
             }
             break;
         case VIEWS.TOOL_FILE_BROWSER:
@@ -13162,9 +13531,15 @@ function enterToolsMenu() {
         if (!Array.isArray(overtakes) || overtakes.length === 0) return;
         const tools = Array.isArray(toolModules) ? toolModules : [];
         const merged = [];
-        for (const t of tools) merged.push(Object.assign({}, t, { kind: 'tool' }));
+        for (const t of tools) {
+            const isSuspended = !!(t.id && suspendedOvertakes[t.id]);
+            merged.push(Object.assign({}, t, { kind: 'tool', suspended: isSuspended }));
+        }
         if (tools.length > 0) merged.push({ type: 'divider', label: 'Overtake Modules' });
-        for (const o of overtakes) merged.push(Object.assign({}, o, { kind: 'overtake' }));
+        for (const o of overtakes) {
+            const isSuspended = !!(o.id && suspendedOvertakes[o.id]);
+            merged.push(Object.assign({}, o, { kind: 'overtake', suspended: isSuspended }));
+        }
         toolModules = merged;
         if (toolsMenuIndex == null || toolsMenuIndex < 0 || toolsMenuIndex >= merged.length
             || (merged[toolsMenuIndex] && merged[toolsMenuIndex].type === 'divider')) {
@@ -13173,6 +13548,29 @@ function enterToolsMenu() {
     } catch (e) {
         debugLog("enterToolsMenu overtake merge failed: " + e);
     }
+}
+
+/* Tools shortcut → resume the most-recently-suspended tool when triggered
+ * via double-tap of Shift+Vol+Step13 OR Shift+long-press-Step13 (shim sets the
+ * resume_last_tool hint for the latter). Returns true if the resume fired,
+ * false if the caller should fall through to the normal Tools-menu open. */
+function tryResumeSuspendedTool() {
+    const now = Date.now();
+    const isDoubleTap = (now - lastToolsShortcutMs) < TOOLS_DOUBLE_TAP_MS;
+    lastToolsShortcutMs = now;
+    let shimHint = false;
+    try {
+        if (typeof shadow_consume_resume_last_tool === "function") {
+            shimHint = shadow_consume_resume_last_tool() !== 0;
+        }
+    } catch (e) { /* ignore */ }
+    if (!isDoubleTap && !shimHint) return false;
+    if (!lastSuspendedToolId || !suspendedOvertakes[lastSuspendedToolId]) {
+        debugLog("tryResumeSuspendedTool: nothing suspended (lastId=" + lastSuspendedToolId + ")");
+        return false;
+    }
+    debugLog("Tools shortcut " + (shimHint ? "long-press" : "double-tap") + " → resuming " + lastSuspendedToolId);
+    return resumeOvertakeModule(lastSuspendedToolId);
 }
 function drawToolsMenu() { _drawToolsMenu(); }
 function drawToolFileBrowser() { _drawToolFileBrowser(); }
@@ -13528,6 +13926,14 @@ globalThis.init = function() {
 
     /* Auto-update check is manual only (Settings → Updates → Check Updates) */
 
+    /* Detect whether the self-heal entrypoint is installed. If not, the
+     * device is in the "needs bootstrap" state — first tick will surface
+     * a one-shot banner pointing at the web manager / GUI installer. */
+    shimBootstrapNeeded = detectShimBootstrapNeeded();
+    if (shimBootstrapNeeded) {
+        debugLog("init: self-heal bootstrap needed (entrypoint at /opt/move/Move lacks schwung-heal)");
+    }
+
     /* Process any HTML left by a prior background download, then kick off
      * a new background download if the cache is stale. Both are non-blocking. */
     try { processDownloadedHtml(); } catch (e) { debugLog("Manual process: " + e); }
@@ -13701,6 +14107,23 @@ globalThis.tick = function() {
                 analyticsPromptSelection = 0;
                 announce("Usage Statistics, Send anonymous data? Yes");
                 /* Don't dismiss display — keep showing prompt */
+            } else if (shimBootstrapNeeded && !shimBootstrapPromptShown) {
+                /* One-shot repair prompt: the live entrypoint at /opt/move/Move
+                 * doesn't include the schwung-heal call, so the self-heal
+                 * mechanism isn't running. Updates via web manager will
+                 * silently no-op at the privileged-write step until this is
+                 * repaired (web manager / GUI installer / SSH). Show the
+                 * pointer screen once per boot so the user is unmistakeably
+                 * informed instead of staring at a silently-stale install. */
+                shimBootstrapPromptShown = true;
+                storePickerResultTitle = 'Schwung Repair';
+                storePickerMessage = 'Repair needed. visit\n' +
+                                     'http://move.local:7700\n' +
+                                     'or rerun GUI installer';
+                storePickerFromSettings = false;
+                storeReturnView = null;
+                view = VIEWS.STORE_PICKER_RESULT;
+                announce(storePickerMessage);
             } else {
                 /* Dismiss shadow display mode — return to Move's native UI */
                 if (typeof shadow_request_exit === "function") {
@@ -13770,7 +14193,28 @@ globalThis.tick = function() {
             if (flags & SHADOW_UI_FLAG_JUMP_TO_TOOLS) {
                 debugLog("TOOLS flag detected, entering Tools menu");
                 try {
-                    enterToolsMenu();
+                    if (!tryResumeSuspendedTool()) {
+                        /* Park (or fully exit) the active overtake before
+                         * the view flips to TOOLS — otherwise its DSP and
+                         * JS callbacks orphan: not in suspendedOvertakes
+                         * (no * marker), still loaded in slot 0. Re-selecting
+                         * the same module from the menu then takes the
+                         * fresh-load path and the shim destroys+recreates
+                         * the DSP, wiping all sequencer state. */
+                        if (overtakeModuleLoaded && overtakeModuleCallbacks) {
+                            if (overtakeSuspendKeepsJs) {
+                                debugLog("TOOLS flag: suspending active overtake before menu");
+                                suspendOvertakeMode();
+                            } else if (toolOvertakeActive) {
+                                debugLog("TOOLS flag: exiting active tool before menu");
+                                exitToolOvertake();
+                            } else {
+                                debugLog("TOOLS flag: exiting active overtake before menu");
+                                exitOvertakeMode();
+                            }
+                        }
+                        enterToolsMenu();
+                    }
                 } catch (e) {
                     debugLog("TOOLS flag: enterToolsMenu threw: " + e + " stack=" + (e && e.stack ? e.stack : "none"));
                 }
@@ -13964,6 +14408,10 @@ globalThis.tick = function() {
             for (let i = 0; i < SHADOW_UI_SLOTS; i++) {
                 lastSlotModuleSignatures[i] = "";  /* force refresh */
                 refreshSlotModuleSignature(i);
+                /* Drop any pending user-cleared flag from the outgoing set;
+                 * the new set's emptiness/non-emptiness is determined by its
+                 * own files, not by what the user did before the switch. */
+                slotUserCleared[i] = false;
             }
 
             /* Suppress autosave briefly so async DSP settling doesn't
@@ -14534,6 +14982,10 @@ globalThis.tick = function() {
             drawMessageOverlay(warningTitle, warningLines);
         }
 
+        if (feedbackGateActive()) {
+            feedbackGateDraw();
+        }
+
         /* Draw overlay on top of main view (uses shared overlay system) */
         drawOverlay();
     }
@@ -14598,6 +15050,14 @@ globalThis.onMidiMessageInternal = function(data) {
     /* Debug: log all MIDI when in overtake mode to diagnose escape issues */
     if (view === VIEWS.OVERTAKE_MODULE || view === VIEWS.OVERTAKE_MENU) {
         debugLog(`MIDI_IN: view=${view} status=${status} d1=${d1} d2=${d2} loaded=${overtakeModuleLoaded} callbacks=${!!overtakeModuleCallbacks}`);
+    }
+
+    /* Feedback gate intercepts CC input while modal is showing */
+    if (feedbackGateActive() && (status & 0xF0) === 0xB0) {
+        if (feedbackGateInput(d1, d2)) {
+            needsRedraw = true;
+            return;
+        }
     }
 
     if (view === VIEWS.CANVAS && (status & 0xF0) === 0xB0) {

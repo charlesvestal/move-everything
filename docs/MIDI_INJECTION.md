@@ -1,5 +1,20 @@
 # MIDI Injection and Echo Filter Problem
 
+> **Status: historical.** This document captures the design journey
+> behind injecting transformed MIDI back into Move's native synth
+> engine, including the multi-pad echo race that we never fully solved
+> via refcounting. The shipped solution is documented in
+> [ADDRESSING_MOVE_SYNTHS.md](ADDRESSING_MOVE_SYNTHS.md); read this
+> file only if you need the historical context for why that API looks
+> the way it does.
+>
+> **For external-MIDI channel remapping specifically:** the cable-2
+> echo cascade described in this doc is the *reason* there's now a
+> shim-side `/schwung-ext-midi-remap` SHM that overtake modules use to
+> rewrite cable-2 channels before Move sees them. See CLAUDE.md
+> "Cable-2 Channel Remap" and `host_ext_midi_remap_*` in `docs/API.md`.
+> Do not re-inject from `onMidiMessageExternal` — it cascades.
+
 Documents attempts to inject MIDI events into Move's SPI mailbox to make shadow chain MIDI FX (chord, arp, strum) play on Move's native synth engine.
 
 ## Goal

@@ -43,6 +43,7 @@ Optional fields: `description`, `author`, `ui`, `ui_chain`, `dsp`, `defaults`, `
 - `abbrev`: Short display name (3-6 chars) for Shadow UI slot display (e.g., "SF2", "Dexed", "CLAP")
 - `module.json` is parsed by a minimal JSON reader. Use double quotes for keys, lowercase `true`/`false`, and avoid comments.
 - Keep `module.json` reasonably small (the loader caps it at 8KB).
+- `dsp`: any filename inside the module directory. The host loads whatever path you specify here, so `dsp.so`, `<module-id>.so`, or anything else is fine for standalone modules. **Exception — `audio_fx` modules used inside Signal Chain:** the chain host loads the FX directly as `modules/audio_fx/<id>/<id>.so` (it does not consult the FX's `module.json`), so audio FX shared libraries **must** be named `<module-id>.so`. Sound generators and MIDI sources loaded by the chain are hardcoded to `dsp.so`.
 
 ### Capabilities
 
@@ -69,14 +70,24 @@ for keys anywhere in `module.json`).
 | `audio_out` | Module produces audio |
 | `audio_in` | Module uses audio input |
 | `midi_in` | Module processes MIDI input |
-| `midi_out` | Module sends MIDI output |
+| `midi_out` | Module sends MIDI output (chain MIDI FX, generator tools) |
 | `aftertouch` | Module uses aftertouch |
 | `claims_master_knob` | Module handles volume knob (CC 79) instead of host |
 | `raw_midi` | Skip host MIDI transforms (velocity curve, aftertouch filter); module may also bypass internal MIDI filters when set |
 | `raw_ui` | Module owns UI input handling; host won't intercept Back to return to menu (use `host_return_to_menu()` to exit) |
 | `chainable` | Marks a module as usable inside Signal Chain patches (metadata) |
 | `skip_led_clear` | Host skips clearing LEDs on module load/unload — preserves Move's native pad colors (useful for modules that overlay highlights on existing clip colors) |
+| `default_forward_channel` | Default Forward Channel for shadow slots loading this module. `-2` = passthrough (preserve original MIDI channel, required for MPE), `1`–`16` = remap to a specific channel. |
+| `button_passthrough` | Array of CC numbers the module wants Move to keep handling (e.g. `[85]` to let Play reach Move while the module is active). |
+| `suspend_keeps_js` | Tool/overtake modules: pressing Back suspends the UI but the DSP keeps ticking; full exit requires Shift+Back. Useful for sequencers that should keep playing while you browse Move. |
 | `component_type` | Module category: `sound_generator`, `audio_fx`, `midi_fx`, `utility`, `system`, `featured`, `overtake`, or `tool` |
+
+> **Where these are read.** `src/host/module_manager.c` (used by the
+> standalone host runtime) currently parses only `claims_master_knob`,
+> `raw_midi`, and `raw_ui`. The remaining flags are honored in the
+> shim and shadow UI code paths that actually run on device — search
+> for the flag name in `src/schwung_shim.c`, `src/shadow/shadow_ui.{c,js}`,
+> and `src/modules/chain/dsp/chain_host.c` to find the consumer.
 
 ### Tool Config
 
@@ -98,7 +109,7 @@ Tool modules (`"component_type": "tool"`) appear in the Tools menu and support a
 | `input_extensions` | Array of file extensions the tool accepts (e.g., `[".wav"]`) |
 | `allow_new_file` | Show a "+ New File" action in the file browser |
 | `command` | Shell command to run for non-interactive tools |
-| `overtake` | Set to `false` to prevent tool from using overtake display mode |
+| `overtake` | `true` to use overtake display mode (full LED clear, ~500ms init delay, Shift+Vol+Jog-Click exit). Default is `false`. |
 
 Interactive tools use `host_exit_module()` to return to the tools menu when the user presses Back.
 
@@ -1033,6 +1044,80 @@ These map to knobs 1-8 in the Shadow UI for quick access.
 }
 ```
 
+### Recognized Units
+
+The shared shadow-UI formatter (`src/shared/param_format.mjs`) renders any
+`chain_params` entry that declares a `unit` field consistently across modules.
+Recognized units:
+
+| Unit  | Behavior                                                 | Example display     |
+|-------|----------------------------------------------------------|---------------------|
+| `dB`  | Signed, decimals from `step` (fallback 1)                | `-6.0 dB`           |
+| `Hz`  | Auto-scales to kHz at >= 1000                            | `440 Hz`, `1.50 kHz`|
+| `ms`  | Non-negative, decimals from `step` (fallback 1)          | `12.5 ms`           |
+| `sec` | Non-negative, decimals from `step` (fallback 3)          | `1.234 sec`         |
+| `%`   | Values in `0..1` are scaled ×100; values >1 shown raw    | `50%`               |
+| `st`  | Semitones; signed integer with explicit `+` prefix       | `+7 st`, `-3 st`    |
+| `BPM` | Integer                                                  | `120 BPM`           |
+
+Other unit strings are appended verbatim with a leading space (e.g. `unit:"cents"` → `"200 cents"`).
+
+`display_format` (printf-style `.Nf` or `.N%`) overrides decimal selection but
+still appends the unit suffix when present (e.g. `display_format:"%.2f"` with
+`unit:"Hz"` → `"440.00 Hz"`).
+
+For raw `set_param` writes the wire value never includes the unit suffix —
+just the numeric string, with at least 3 decimals for floats.
+
+#### `%` units and `max`
+
+When using `unit:"%"`, **declare `max` explicitly** so the formatter knows
+whether your raw values are normalized (`0..1`) or already in display range
+(`0..100`). Without `max`, the default is `1` and the formatter scales by
+×100 — a module that stores percentages as `0..100` and forgets `max:100`
+will see `50` displayed as `5000%`.
+
+#### Enum wire format
+
+By default the formatter sends the option's numeric INDEX over the
+`set_param` wire. If your DSP plugin only accepts the option's STRING label
+(no `atoi` fallback in `set_param`), declare `options_as_string: true` on the
+chain_params entry. The shadow UI's enum cycle path is independent of this
+setting (it auto-detects from the plugin's `get_param` echo), so most modules
+don't need to set it.
+
+### Knob Acceleration
+
+All chain / master-FX / slot / patch param knob edits share one acceleration
+curve from `src/shared/knob_engine.mjs`. Modules don't opt in — every numeric
+adjust path runs through the same engine.
+
+| Time since last tick | Step divisor          |
+|----------------------|-----------------------|
+| First tick (cold)    | 1 (unscaled "click")  |
+| < 50 ms              | 4 (fast sweep)        |
+| 50 – 150 ms          | 8                     |
+| > 150 ms             | 16 (fine control)     |
+| > 2 seconds          | self-reset (staleness)|
+
+`int` and `enum` params accumulate raw ticks until the divisor threshold,
+then emit `floor(|accum| / divisor)` integer steps per call so a fast jog
+sweep (batched delta) advances proportionally — a delta of 8 with divisor=4
+emits 2 steps. `enum` types use a fixed `enum_divisor = 10` ticks per option
+regardless of count — binary toggles and 47-option pickers feel equally
+snappy.
+
+The engine **self-resets** after a >2 second idle gap, so re-entering a
+parameter editor after a long pause feels like a fresh edit rather than
+continuing a stale acceleration curve. There's no JS-side lifecycle plumbing
+to maintain — the engine handles it internally.
+
+Default float step (when a chain_params entry doesn't declare `step`) is
+`0.01`. Default int step is `1`. Modules that need a different feel should
+declare `step` explicitly. (Note: this is half the previous default of
+`0.02` for floats — most modules already declare step, so this is invisible
+in practice.)
+
 ## Shared Utilities
 
 Import path from modules: `../../shared/<file>.mjs`
@@ -1318,6 +1403,8 @@ Note: Audio input routing depends on the last selected input in the stock Move i
 ## Audio FX Plugin API
 
 Audio effects use an in-place processing API. The v2 API supports multiple instances:
+
+**Filename:** When loaded inside Signal Chain, the chain host expects the shared library at `modules/audio_fx/<id>/<id>.so` — it does not read `module.json`'s `dsp` field. Name your audio FX shared library `<module-id>.so` (e.g. `freeverb.so`, `cloudseed.so`), not `dsp.so`.
 
 ```c
 typedef struct audio_fx_api_v2 {

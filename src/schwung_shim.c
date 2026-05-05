@@ -152,8 +152,11 @@ static volatile float shadow_master_volume;  /* Defined later */
 static bool shadow_ui_enabled = true;      /* Shadow UI enabled by default */
 static bool display_mirror_enabled = false; /* Display mirror off by default */
 static bool set_pages_enabled = true;      /* Set pages enabled by default */
+static bool ext_midi_remap_feature_enabled = true; /* Cable-2 channel remap on by default */
 static bool skipback_require_volume = false; /* false=Shift+Capture, true=Shift+Vol+Capture */
 static int skipback_seconds_setting = SKIPBACK_DEFAULT_SECONDS; /* Skipback rolling buffer length */
+/* Shadow UI trigger mode: 0=long-press only, 1=Shift+Vol only, 2=both. Default=both. */
+static uint8_t shadow_ui_trigger_setting = 2;
 
 /* Worker that performs the skipback buffer resize off the audio path. */
 static void *skipback_resize_thread(void *arg) {
@@ -162,6 +165,9 @@ static void *skipback_resize_thread(void *arg) {
     return NULL;
 }
 static int shadow_speaker_active = 1;      /* 1=built-in speaker, 0=headphones/line-out (from CC 115) */
+static int shadow_speaker_active_known = 0; /* 1 once any CC 115 jack-detect has been observed */
+static int shadow_line_in_connected = 0;       /* 1 = cable plugged, 0 = internal mic active (from CC 114) */
+static int shadow_line_in_connected_known = 0; /* 1 once any CC 114 jack-detect has been observed */
 /* Long-press Track/Menu/Step2 shortcuts — always enabled */
 
 /* ----- RBJ biquad (direct form I transposed) for speaker-EQ compensation -----
@@ -741,13 +747,22 @@ static void shadow_update_held_track(uint8_t cc, int pressed)
     }
 }
 
-/* Long-press detection — always enabled. */
-#define LONG_PRESS_ACTIVE() 1
+/* Shadow-UI trigger gating.
+ * Read live from shadow_control->shadow_ui_trigger so JS toggles take effect immediately.
+ * Falls back to the boot-time setting if shadow_control isn't mapped yet. */
+#define SHADOW_UI_TRIGGER_MODE() \
+    (shadow_control ? shadow_control->shadow_ui_trigger : shadow_ui_trigger_setting)
+#define LONG_PRESS_ACTIVE() (SHADOW_UI_TRIGGER_MODE() == 0 || SHADOW_UI_TRIGGER_MODE() == 2)
+#define SHIFT_VOL_ACTIVE()  (SHADOW_UI_TRIGGER_MODE() == 1 || SHADOW_UI_TRIGGER_MODE() == 2)
 #define LONG_PRESS_MS 500
 
 static struct timespec track_press_time[4];
 static uint8_t track_longpress_pending[4];
 static uint8_t track_longpress_fired[4];
+/* Set if the volume knob is touched at any point while a Track button is held.
+ * Once set, that track's long-press is suppressed for the remainder of the press,
+ * so adjusting a track's volume never opens the shadow UI. Cleared on press/release. */
+static uint8_t track_vol_touched_during_press[4];
 
 static struct timespec menu_press_time;
 static uint8_t menu_longpress_pending;
@@ -756,6 +771,10 @@ static uint8_t menu_longpress_fired;
 static struct timespec step2_press_time;
 static uint8_t step2_longpress_pending;
 static uint8_t step2_longpress_fired;
+
+static struct timespec step13_press_time;
+static uint8_t step13_longpress_pending;
+static uint8_t step13_longpress_fired;
 
 static inline int long_press_elapsed(const struct timespec *start) {
     struct timespec now;
@@ -899,6 +918,19 @@ static void load_feature_config(void)
         }
     }
 
+    /* Parse ext_midi_remap_enabled (defaults to true) */
+    const char *ext_midi_remap_key = strstr(config_buf, "\"ext_midi_remap_enabled\"");
+    if (ext_midi_remap_key) {
+        const char *colon = strchr(ext_midi_remap_key, ':');
+        if (colon) {
+            colon++;
+            while (*colon == ' ' || *colon == '\t') colon++;
+            if (strncmp(colon, "false", 5) == 0) {
+                ext_midi_remap_feature_enabled = false;
+            }
+        }
+    }
+
     /* Parse set_pages_enabled (defaults to true) */
     const char *set_pages_key = strstr(config_buf, "\"set_pages_enabled\"");
     if (set_pages_key) {
@@ -925,6 +957,35 @@ static void load_feature_config(void)
         }
     }
 
+    /* Parse shadow_ui_trigger ("long_press" | "shift_vol" | "both"; default "both").
+     * Legacy: if the string key is missing, fall back to bool "long_press_shadow"
+     * (true → both, false → shift_vol). */
+    const char *trigger_key = strstr(config_buf, "\"shadow_ui_trigger\"");
+    if (trigger_key) {
+        const char *colon = strchr(trigger_key, ':');
+        if (colon) {
+            colon++;
+            while (*colon == ' ' || *colon == '\t' || *colon == '"') colon++;
+            if (strncmp(colon, "long_press", 10) == 0) {
+                shadow_ui_trigger_setting = 0;
+            } else if (strncmp(colon, "shift_vol", 9) == 0) {
+                shadow_ui_trigger_setting = 1;
+            } else {
+                shadow_ui_trigger_setting = 2;
+            }
+        }
+    } else {
+        const char *legacy_key = strstr(config_buf, "\"long_press_shadow\"");
+        if (legacy_key) {
+            const char *colon = strchr(legacy_key, ':');
+            if (colon) {
+                colon++;
+                while (*colon == ' ' || *colon == '\t') colon++;
+                shadow_ui_trigger_setting = (strncmp(colon, "false", 5) == 0) ? 1 : 2;
+            }
+        }
+    }
+
     /* Parse skipback_seconds (defaults to SKIPBACK_DEFAULT_SECONDS, clamped) */
     const char *skipback_secs_key = strstr(config_buf, "\"skipback_seconds\"");
     if (skipback_secs_key) {
@@ -940,15 +1001,18 @@ static void load_feature_config(void)
         }
     }
 
+    static const char *trigger_names[] = {"long_press", "shift_vol", "both"};
+    const char *trigger_name = trigger_names[shadow_ui_trigger_setting < 3 ? shadow_ui_trigger_setting : 2];
     char log_msg[256];
     snprintf(log_msg, sizeof(log_msg),
-             "Features: shadow_ui=%s, link_audio=%s, display_mirror=%s, set_pages=%s, skipback=%s, skipback_buf=%ds",
+             "Features: shadow_ui=%s, link_audio=%s, display_mirror=%s, set_pages=%s, skipback=%s, skipback_buf=%ds, ui_trigger=%s",
              shadow_ui_enabled ? "enabled" : "disabled",
              link_audio.enabled ? "enabled" : "disabled",
              display_mirror_enabled ? "enabled" : "disabled",
              set_pages_enabled ? "enabled" : "disabled",
              skipback_require_volume ? "Shift+Vol+Capture" : "Shift+Capture",
-             skipback_seconds_setting);
+             skipback_seconds_setting,
+             trigger_name);
     shadow_log(log_msg);
 }
 
@@ -1083,11 +1147,14 @@ static void shadow_inprocess_process_midi(void) {
                 sampler_on_clock(status_usb);
             }
 
-            /* Deliver realtime messages to the overtake DSP from cable 2 only
-             * (external USB MIDI clock). Move's internal cable 0 mirrors the
-             * same tempo, so using just cable 2 avoids double-counting while
-             * still covering the user's "clock from external device" case. */
-            if (cable == 2 && overtake_dsp_gen && overtake_dsp_gen_inst && overtake_dsp_gen->on_midi) {
+            /* Deliver realtime to overtake DSP from cable 0 (Move's internal
+             * transport). Cable 0 always carries Move's transport state when
+             * running, including when Move is slaved to an external master,
+             * so it works regardless of the user's MIDI Clock Out preference.
+             * Cable 2 was tried previously but is only populated when clock-
+             * out is enabled, so users with clock-out off saw 3po never start
+             * on Play. Mirrors the sampler_on_clock cable-0 choice above. */
+            if (cable == 0 && overtake_dsp_gen && overtake_dsp_gen_inst && overtake_dsp_gen->on_midi) {
                 uint8_t msg[1] = { status_usb };
                 overtake_dsp_gen->on_midi(overtake_dsp_gen_inst, msg, 1, MOVE_MIDI_SOURCE_EXTERNAL);
             }
@@ -2108,7 +2175,16 @@ skip_la_rebuild:
      * stage inside the emulation will generate slightly different harmonic
      * content at non-unity mv than stock Move does. Audibility at <-6 dB is
      * negligible; revisit if measurements show a mismatch at loud volumes. */
-    if (rebuild_from_la && shadow_speaker_active && speaker_eq_initialized) {
+    /* Speaker EQ requires us to know which output is active. We boot with
+     * shadow_speaker_active=1 as a guess, but defer applying EQ until we've
+     * actually observed a CC 115 jack-detect event from XMOS. Otherwise an
+     * already-plugged HP at boot (or after an in-flight install.sh restart
+     * where XMOS doesn't re-broadcast jack state) gets the speaker EQ wrongly
+     * applied — phasey/hollow audio that only resolves on jack replug.
+     * XMOS broadcasts CC 115 within ~180ms of shim init at every boot, so the
+     * gate clears almost immediately on a real session. */
+    if (rebuild_from_la && shadow_speaker_active && shadow_speaker_active_known
+        && speaker_eq_initialized) {
         speaker_eq_process(mailbox_audio, FRAMES_PER_BLOCK);
     }
 
@@ -2126,6 +2202,23 @@ skip_la_rebuild:
                 shadow_slot_fx_idle[s] = 0;
                 shadow_slot_fx_silence_frames[s] = 0;
             }
+        }
+
+        /* Sampler source request from shadow UI (used by tool modules that need
+         * to record from a specific source — e.g. the assistant needs Move Input
+         * for voice). 1=Resample, 2=Move Input. Reset to 0 after applying.
+         * Processed BEFORE sampler_cmd so a "set source then start" sequence in
+         * the same tick captures audio from the requested source. */
+        uint8_t src_req = shadow_control->sampler_source_request;
+        if (src_req != 0) {
+            shadow_control->sampler_source_request = 0;
+            sampler_source = (src_req == 2)
+                ? SAMPLER_SOURCE_MOVE_INPUT
+                : SAMPLER_SOURCE_RESAMPLE;
+            shadow_overlay_sync();
+            unified_log("shim", LOG_LEVEL_INFO,
+                       "sampler source request applied: req=%u -> source=%d (0=Resample,1=MoveInput)",
+                       src_req, (int)sampler_source);
         }
 
         /* Skipback buffer resize: settings UI writes new desired length to
@@ -2161,6 +2254,9 @@ skip_la_rebuild:
                 fclose(pf);
             }
             if (path_buf[0]) {
+                unified_log("shim", LOG_LEVEL_INFO,
+                           "sampler start: path=%s source=%d (0=Resample,1=MoveInput)",
+                           path_buf, (int)sampler_source);
                 sampler_start_recording_to(path_buf);
             }
         } else if (cmd == 2) {
@@ -2231,6 +2327,7 @@ static uint8_t last_shadow_midi_out_ready = 0;
 static shadow_midi_dsp_t *shadow_midi_dsp_shm = NULL;  /* MIDI to DSP from shadow UI */
 static uint8_t last_shadow_midi_dsp_ready = 0;
 static shadow_midi_inject_t *shadow_midi_inject_shm = NULL;  /* MIDI inject into Move's MIDI_IN */
+static schwung_ext_midi_remap_t *ext_midi_remap_shm = NULL;  /* Cable-2 channel remap table */
 
 static uint32_t last_screenreader_sequence = 0;  /* Track last spoken message */
 static uint64_t last_speech_time_ms = 0;  /* Rate limiting for TTS */
@@ -2249,6 +2346,7 @@ static int shm_param_fd = -1;
 static int shm_midi_out_fd = -1;
 static int shm_midi_dsp_fd = -1;
 static int shm_midi_inject_fd = -1;
+static int shm_ext_midi_remap_fd = -1;
 static int shm_screenreader_fd = -1;
 static int shm_pub_audio_fd = -1;
 static int shm_overlay_fd = -1;
@@ -2698,6 +2796,27 @@ static void init_shadow_shm(void)
         }
     } else {
         printf("Shadow: Failed to create midi_inject shm\n");
+    }
+
+    /* Create/open cable-2 channel remap shared memory (active overtake module writes,
+     * shim reads on every SPI frame to rewrite cable-2 MIDI_IN channel byte). */
+    shm_ext_midi_remap_fd = shm_open(SHM_SHADOW_EXT_MIDI_REMAP, O_CREAT | O_RDWR, 0666);
+    if (shm_ext_midi_remap_fd >= 0) {
+        ftruncate(shm_ext_midi_remap_fd, sizeof(schwung_ext_midi_remap_t));
+        ext_midi_remap_shm = (schwung_ext_midi_remap_t *)mmap(NULL, sizeof(schwung_ext_midi_remap_t),
+                                                              PROT_READ | PROT_WRITE,
+                                                              MAP_SHARED, shm_ext_midi_remap_fd, 0);
+        if (ext_midi_remap_shm == MAP_FAILED) {
+            ext_midi_remap_shm = NULL;
+            printf("Shadow: Failed to mmap ext_midi_remap shm\n");
+        } else {
+            memset(ext_midi_remap_shm, 0, sizeof(schwung_ext_midi_remap_t));
+            ext_midi_remap_shm->version = EXT_MIDI_REMAP_VERSION;
+            ext_midi_remap_shm->enabled = 0;
+            memset((void *)ext_midi_remap_shm->remap, EXT_MIDI_REMAP_PASSTHROUGH, 16);
+        }
+    } else {
+        printf("Shadow: Failed to create ext_midi_remap shm\n");
     }
 
     /* Create/open screen reader shared memory (for accessibility: TTS and D-Bus announcements) */
@@ -3390,6 +3509,16 @@ static ssize_t (*real_read)(int fd, void *buf, size_t count) = NULL;
  * ============================================================================ */
 static int shim_subsystems_initialized = 0;
 
+/* Sampler-specific announce wrapper. Tool modules that drive the sampler
+ * programmatically set shadow_control->sampler_silent to suppress the
+ * system "Sample saved" / "Recording failed" voice messages so the user
+ * only hears the tool's own TTS (if any). */
+static void sampler_announce_maybe_silent(const char *msg)
+{
+    if (shadow_control && shadow_control->sampler_silent) return;
+    send_screenreader_announcement(msg);
+}
+
 static void shim_init_subsystems(void)
 {
     if (shim_subsystems_initialized) return;
@@ -3431,11 +3560,16 @@ static void shim_init_subsystems(void)
         };
         chain_mgmt_init(&cm_host);
     }
-    /* Initialize sampler subsystem with callbacks to shim functions */
+    /* Sampler announce wrapper: defined inline above so this scope can
+     * reference it. (Hoisted via the prototype near the top of the file.) */
+    /* Initialize sampler subsystem with callbacks to shim functions.
+     * Use a wrapper for `announce` so tool modules can suppress sampler
+     * chatter ("Sample saved", etc.) by setting
+     * shadow_control->sampler_silent. */
     {
         sampler_host_t sampler_host = {
             .log = shadow_log,
-            .announce = send_screenreader_announcement,
+            .announce = sampler_announce_maybe_silent,
             .overlay_sync = shadow_overlay_sync,
             .run_command = shim_run_command,
             .global_mmap_addr = &global_mmap_addr,
@@ -3467,8 +3601,9 @@ static void shim_init_subsystems(void)
         shadow_control->set_pages_enabled = set_pages_enabled ? 1 : 0;
         shadow_control->skipback_require_volume = skipback_require_volume ? 1 : 0;
         shadow_control->skipback_seconds = (uint16_t)skipback_seconds_setting;
-        shadow_control->long_press_shadow = 1; /* always enabled */
+        shadow_control->shadow_ui_trigger = shadow_ui_trigger_setting;
         shadow_control->speaker_active = 1; /* assume speaker at boot; CC 115 will correct */
+        shadow_control->line_in_connected = 0; /* assume internal mic at boot; CC 114 will correct */
     }
 
     /* Precompute speaker-EQ biquad coefficients. SR is 44.1 kHz (Move's audio engine). */
@@ -3923,6 +4058,20 @@ static uint64_t spi_fwd_ext_cc_sum = 0, spi_fwd_ext_cc_max = 0;
 static uint64_t spi_direct_midi_sum = 0, spi_direct_midi_max = 0;
 static int spi_granular_count = 0;
 
+/* XMOS jack-detect / SysEx logger — dormant unless flag file exists.
+ * Flag: /data/UserData/schwung/log_xmos_sysex_on
+ * Output: /data/UserData/schwung/xmos_sysex.txt
+ * Used by scripts/collect-diagnostics.sh and the schwung-manager web UI to
+ * capture host↔XMOS MIDI traffic during the "hollow / phasey audio" bug
+ * investigation. Zero overhead when the flag file is absent.
+ * State shared between pre/post transfer callbacks.
+ * Hard size cap (XMOS_LOG_MAX_BYTES) protects against runaway log growth
+ * if a user leaves the flag armed indefinitely. */
+#define XMOS_LOG_MAX_BYTES (8 * 1024 * 1024)  /* 8 MB safety cap */
+static int xmos_log_fd = -1;
+static uint32_t xmos_frame = 0;
+static uint64_t xmos_log_bytes = 0;
+
 #define TIME_SECTION_START() clock_gettime(CLOCK_MONOTONIC, &spi_section_start)
 #define TIME_SECTION_END(sum_var, max_var) do { \
     clock_gettime(CLOCK_MONOTONIC, &spi_section_end); \
@@ -4040,6 +4189,90 @@ static void shim_pre_transfer(void *ctx, uint8_t *shadow, int size)
 
             inject_cooldown = 44;
             shadow_log("SPI SysEx inject: audio source change sent");
+        }
+    }
+
+    /* XMOS SysEx + jack-detect logger — dormant unless flag file exists.
+     * Captures cin 0x04..0x07 (SysEx framing) packets in MIDI_OUT and
+     * cc=114/115 (line-in / line-out detect) events in MIDI_IN.
+     * PRE-transfer log point: this block. POST-transfer (hw view) log
+     * point: just before the hw→shadow memcpy in shim_post_transfer. */
+    {
+        static int xmos_log_checked = 0;
+        if (xmos_log_checked++ % 44 == 0) {  /* check every ~1s */
+            int want = (access("/data/UserData/schwung/log_xmos_sysex_on", F_OK) == 0);
+            if (want && xmos_log_fd < 0) {
+                xmos_log_fd = open("/data/UserData/schwung/xmos_sysex.txt",
+                                   O_WRONLY | O_CREAT | O_APPEND, 0644);
+                xmos_log_bytes = 0;
+            } else if (!want && xmos_log_fd >= 0) {
+                close(xmos_log_fd);
+                xmos_log_fd = -1;
+            }
+        }
+        /* Hard size cap: stop writing once the file exceeds XMOS_LOG_MAX_BYTES.
+         * Don't close the fd — the next flag-check tick will close it cleanly. */
+        if (xmos_log_fd >= 0 && xmos_log_bytes < XMOS_LOG_MAX_BYTES) {
+            xmos_frame++;
+            char line[128];
+            /* Mark the first frame after arming so boot captures are easy to find. */
+            static int xmos_log_first_frame_written = 0;
+            if (!xmos_log_first_frame_written) {
+                int n = snprintf(line, sizeof(line),
+                    "[f%u] BOOT first armed frame (xmos_frame counter resets per shim load)\n",
+                    xmos_frame);
+                if (write(xmos_log_fd, line, n) > 0) xmos_log_bytes += (uint64_t)n;
+                xmos_log_first_frame_written = 1;
+            }
+            const uint8_t *midi_out = shadow + MIDI_OUT_OFFSET;
+            int any = 0;
+            for (int i = 0; i < 80; i += 4) {
+                uint8_t cin = midi_out[i] & 0x0F;
+                if (cin >= 0x04 && cin <= 0x07) {
+                    int n = snprintf(line, sizeof(line),
+                        "[f%u] PRE  slot=%2d cable=%d cin=0x%x : %02x %02x %02x %02x\n",
+                        xmos_frame, i, (midi_out[i] >> 4) & 0xF, cin,
+                        midi_out[i], midi_out[i+1], midi_out[i+2], midi_out[i+3]);
+                    if (write(xmos_log_fd, line, n) > 0) xmos_log_bytes += (uint64_t)n;
+                    any = 1;
+                }
+            }
+            if (any) {
+                int n = snprintf(line, sizeof(line), "[f%u] PRE  end\n", xmos_frame);
+                if (write(xmos_log_fd, line, n) > 0) xmos_log_bytes += (uint64_t)n;
+            }
+            /* Scan MIDI_IN for jack-detect CCs (114/115) AND incoming SysEx
+             * framing (cin 0x04..0x07) from XMOS. MIDI_IN events are 8 bytes
+             * (4 USB-MIDI + 4 timestamp) at offset 2048. */
+            unsigned char *hw_buf2 = schwung_spi_get_hw(g_spi_handle);
+            if (hw_buf2) {
+                const uint8_t *midi_in = hw_buf2 + 2048;
+                int in_any = 0;
+                for (int i = 0; i < 248; i += 8) {
+                    uint8_t cin = midi_in[i] & 0x0F;
+                    uint8_t status = midi_in[i+1];
+                    uint8_t d1 = midi_in[i+2];
+                    if (cin == 0x0B && (status & 0xF0) == 0xB0 && (d1 == 114 || d1 == 115)) {
+                        int n = snprintf(line, sizeof(line),
+                            "[f%u] IN   slot=%2d cable=%d CC %d val=%d (jack-detect)\n",
+                            xmos_frame, i, (midi_in[i] >> 4) & 0xF,
+                            d1, midi_in[i+3]);
+                        if (write(xmos_log_fd, line, n) > 0) xmos_log_bytes += (uint64_t)n;
+                    }
+                    if (cin >= 0x04 && cin <= 0x07) {
+                        int n = snprintf(line, sizeof(line),
+                            "[f%u] INsys slot=%2d cable=%d cin=0x%x : %02x %02x %02x %02x\n",
+                            xmos_frame, i, (midi_in[i] >> 4) & 0xF, cin,
+                            midi_in[i], midi_in[i+1], midi_in[i+2], midi_in[i+3]);
+                        if (write(xmos_log_fd, line, n) > 0) xmos_log_bytes += (uint64_t)n;
+                        in_any = 1;
+                    }
+                }
+                if (in_any) {
+                    int n = snprintf(line, sizeof(line), "[f%u] INsys end\n", xmos_frame);
+                    if (write(xmos_log_fd, line, n) > 0) xmos_log_bytes += (uint64_t)n;
+                }
+            }
         }
     }
 
@@ -4783,43 +5016,51 @@ pre_done:
     TIME_SECTION_END(spi_screenreader_sum, spi_screenreader_max);
 
     /* === SHORTCUT INDICATOR LEDS ===
-     * When Shift+Vol held, light step icon LEDs (CCs 16-31 = icons below steps).
-     * When long_press enabled and Shift held (without Vol), light Step 2 and Step 13.
-     * Uses shadow_queue_led which gets flushed by shadow_flush_pending_leds above. */
+     * Step 2 icon (CC 17) = Settings; Step 13 icon (CC 28) = Tools. Both
+     * targets are reachable in either trigger mode (Shift+Vol+Step{2,13}
+     * and long-press Shift+Step{2,13}), so light both whenever Shift is
+     * held — regardless of whether the volume knob is also touched. */
     {
-        static int shortcut_leds_on = 0;
-        static int longpress_leds_on = 0;
+        static int step2_lit = 0;
+        static int step13_lit = 0;
 
-        int want_shiftvol = shadow_shift_held && shadow_volume_knob_touched;
+        int want_shiftvol = SHIFT_VOL_ACTIVE() && shadow_shift_held && shadow_volume_knob_touched;
         int want_longpress = LONG_PRESS_ACTIVE() && shadow_shift_held && !shadow_volume_knob_touched;
+        int want_step2 = want_shiftvol || want_longpress;
+        int want_step13 = want_shiftvol || want_longpress;
 
-        if (want_shiftvol && !shortcut_leds_on) {
-            shadow_queue_led(0x0B, 0xB0, 28, 118);  /* Step 13 icon = LightGrey (Tools) */
-            shortcut_leds_on = 1;
-        } else if (!want_shiftvol && shortcut_leds_on) {
-            shadow_queue_led(0x0B, 0xB0, 28, 0);
-            shortcut_leds_on = 0;
+        if (want_step2 && !step2_lit) {
+            shadow_queue_led(0x0B, 0xB0, 17, 118);  /* Step 2 icon = LightGrey (Settings) */
+            step2_lit = 1;
+        } else if (!want_step2 && step2_lit) {
+            shadow_queue_led(0x0B, 0xB0, 17, 0);
+            step2_lit = 0;
         }
 
-        if (want_longpress && !longpress_leds_on) {
-            shadow_queue_led(0x0B, 0xB0, 17, 118);  /* Step 2 icon = LightGrey (Settings) */
+        if (want_step13 && !step13_lit) {
             shadow_queue_led(0x0B, 0xB0, 28, 118);  /* Step 13 icon = LightGrey (Tools) */
-            longpress_leds_on = 1;
-        } else if (!want_longpress && longpress_leds_on) {
-            shadow_queue_led(0x0B, 0xB0, 17, 0);
-            if (!shortcut_leds_on) {
-                shadow_queue_led(0x0B, 0xB0, 28, 0);
-            }
-            longpress_leds_on = 0;
+            step13_lit = 1;
+        } else if (!want_step13 && step13_lit) {
+            shadow_queue_led(0x0B, 0xB0, 28, 0);
+            step13_lit = 0;
         }
     }
 
     /* Long-press threshold checks */
     if (LONG_PRESS_ACTIVE() && shadow_ui_enabled && shadow_control) {
+        /* Sticky suppression: if the volume knob is touched during a track hold,
+         * that track's long-press is killed for the rest of the press so that
+         * adjusting a track's volume never opens the shadow UI. */
+        if (shadow_volume_knob_touched) {
+            for (int i = 0; i < 4; i++) {
+                if (track_longpress_pending[i]) track_vol_touched_during_press[i] = 1;
+            }
+        }
         /* Track buttons */
         for (int i = 0; i < 4; i++) {
             if (track_longpress_pending[i] && !track_longpress_fired[i] &&
                 !shadow_shift_held && !shadow_volume_knob_touched &&
+                !track_vol_touched_during_press[i] &&
                 long_press_elapsed(&track_press_time[i])) {
                 track_longpress_fired[i] = 1;
                 track_longpress_pending[i] = 0;
@@ -4859,6 +5100,19 @@ pre_done:
             launch_shadow_ui();
             shadow_log("Shift+Step2 long-press: opening global settings");
         }
+        /* Shift + Step 13 long-press: resume most-recently-suspended tool */
+        if (step13_longpress_pending && !step13_longpress_fired &&
+            shadow_shift_held && !shadow_volume_knob_touched &&
+            long_press_elapsed(&step13_press_time)) {
+            step13_longpress_fired = 1;
+            step13_longpress_pending = 0;
+            shadow_control->resume_last_tool = 1;
+            shadow_control->ui_flags |= SHADOW_UI_FLAG_JUMP_TO_TOOLS;
+            shadow_display_mode = 1;
+            shadow_control->display_mode = 1;
+            launch_shadow_ui();
+            shadow_log("Shift+Step13 long-press: resuming last tool");
+        }
     }
 
     /* Capture the SPI fd for use by overtake_midi_send_external */
@@ -4895,6 +5149,69 @@ pre_done:
     }
 }
 
+/* === Cable-2 (external USB) MIDI channel remap ===
+ *
+ * Active overtake modules can write a 16-entry channel remap table into
+ * /schwung-ext-midi-remap. The shim reads this table on every SPI frame
+ * (in post_transfer, after the ioctl populates hw MIDI_IN with the
+ * current frame's events, before the ioctl wrapper returns to Move) and
+ * rewrites the channel byte of cable-2 MIDI_IN events in-place. Both the
+ * hw mailbox and shadow buffer are mutated so Move firmware and shim
+ * pre-transfer readers (next frame) see consistent data.
+ *
+ * The remap is bypassed globally whenever any chain slot is configured
+ * forward=THRU (MPE passthrough), because remapping channels destroys
+ * per-channel expression data MPE relies on.
+ *
+ * Solves the cable-2 echo cascade documented in docs/MIDI_INJECTION.md
+ * by rewriting in-place rather than re-injecting from JS.
+ */
+static int any_thru_slot_active(void) {
+    for (int i = 0; i < SHADOW_CHAIN_INSTANCES; i++) {
+        if (shadow_chain_slots[i].forward_channel == SHADOW_FORWARD_THRU) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void shim_remap_cable2_channels(uint8_t *shadow) {
+    if (!ext_midi_remap_feature_enabled) return;  /* Feature flag kill switch */
+    if (!ext_midi_remap_shm || !ext_midi_remap_shm->enabled) return;
+    if (any_thru_slot_active()) return;  /* MPE escape hatch */
+    if (!hardware_mmap_addr) return;
+
+    /* Mutate both hw (so Move sees remapped channels on this frame) and
+     * shadow (so next frame's pre-transfer readers — cable-2 echo filter,
+     * shadow_forward_external_cc_to_out — see consistent data). */
+    uint8_t *targets[2] = { hardware_mmap_addr, shadow };
+    for (int t = 0; t < 2; t++) {
+        uint8_t *buf = targets[t];
+        if (!buf) continue;
+        buf += MIDI_IN_OFFSET;
+        /* MIDI_IN events are 8 bytes (4 USB-MIDI + 4 timestamp). 4-byte
+         * stride visits timestamps and rewrites their bytes when a
+         * timestamp byte happens to look like cable-2 + a non-system
+         * status — corrupts the contiguous event run that Move's MIDI_IN
+         * parser scans (it terminates at the first zero slot). Sparse
+         * buffer hides this; transport-running + external MIDI fills the
+         * buffer and produces SIGABRT deep in Move's stack. */
+        const int MIDI_IN_MAX_BYTES = 8 * 31;     /* 31 events × 8 bytes */
+        for (int j = 0; j < MIDI_IN_MAX_BYTES; j += 8) {
+            uint8_t header = buf[j];
+            if (header == 0) break;               /* end-of-events */
+            uint8_t cable = (header >> 4) & 0x0F;
+            if (cable != 2) continue;             /* only cable-2 (external USB) */
+            uint8_t status = buf[j + 1];
+            if ((status & 0xF0) == 0xF0) continue; /* system messages — channelless */
+            uint8_t in_ch = status & 0x0F;
+            uint8_t mapped = ext_midi_remap_shm->remap[in_ch];
+            if (mapped == EXT_MIDI_REMAP_PASSTHROUGH || mapped >= 16) continue;
+            buf[j + 1] = (status & 0xF0) | (mapped & 0x0F);
+        }
+    }
+}
+
 /* ============================================================================
  * SPI POST-TRANSFER CALLBACK
  * ============================================================================
@@ -4912,6 +5229,39 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
 
     /* Timing: reuse statics from pre-transfer (same translation unit) */
     /* spi_post_start is at file scope */
+
+    /* Cable-2 channel remap: rewrite incoming external MIDI channel bytes in
+     * both hw mailbox (so Move firmware sees remapped channels this frame)
+     * and shadow buffer (so next frame's pre-transfer readers stay
+     * consistent). Must run before any post-transfer logic that reads
+     * MIDI_IN. */
+    shim_remap_cable2_channels(shadow);
+
+    /* XMOS SysEx logger — POST-transfer view of hw[MIDI_OUT] BEFORE the
+     * hw→shadow memcpy below. Lets us see what XMOS left in the slots
+     * (does it clear after consuming, or does data persist?). Pre/post
+     * comparison reveals slot stomping or stale replay. Dormant unless
+     * /data/UserData/schwung/log_xmos_sysex_on exists; honors the same
+     * size cap as the pre-transfer block. */
+    if (xmos_log_fd >= 0 && xmos_log_bytes < XMOS_LOG_MAX_BYTES) {
+        int any = 0;
+        char line[128];
+        for (int i = 0; i < 80; i += 4) {
+            uint8_t cin = hw[i] & 0x0F;
+            if (cin >= 0x04 && cin <= 0x07) {
+                int n = snprintf(line, sizeof(line),
+                    "[f%u] POSThw slot=%2d cable=%d cin=0x%x : %02x %02x %02x %02x\n",
+                    xmos_frame, i, (hw[i] >> 4) & 0xF, cin,
+                    hw[i], hw[i+1], hw[i+2], hw[i+3]);
+                if (write(xmos_log_fd, line, n) > 0) xmos_log_bytes += (uint64_t)n;
+                any = 1;
+            }
+        }
+        if (any) {
+            int n = snprintf(line, sizeof(line), "[f%u] POSThw end\n", xmos_frame);
+            if (write(xmos_log_fd, line, n) > 0) xmos_log_bytes += (uint64_t)n;
+        }
+    }
 
     /* Sync output regions from hardware→shadow.
      * The library only copies the input region (SCHWUNG_OFF_IN_BASE+).
@@ -4996,6 +5346,36 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
             __sync_synchronize();
             shadow_midi_inject_shm->ready++;
             shadow_log("Overtake exit: injected shift-off, volume-touch-off, back-off, jog-click-off");
+        }
+        /* Forced reset of cable-2 channel remap on overtake exit. The active
+         * module owns the table during overtake; on exit, clear it so a
+         * stale table from a crashed module can't bleed into the next
+         * session or into Move's normal operation. */
+        if (prev_overtake_mode != 0 && overtake_mode == 0 && ext_midi_remap_shm) {
+            memset((void *)ext_midi_remap_shm->remap, EXT_MIDI_REMAP_PASSTHROUGH, 16);
+            ext_midi_remap_shm->enabled = 0;
+            __sync_synchronize();
+        }
+        /* Symmetric inject on overtake ENTRY (0→non-zero): if Shift was held when
+         * overtake activated (e.g. Shift+long-press-Step13 → resume tool fires while
+         * the user is still physically holding Shift), inject Shift-off so Move's
+         * firmware doesn't stay in shift-mode (which slows the volume knob, etc.).
+         * Cable-0 input is filtered during overtake, so the eventual physical release
+         * never reaches Move otherwise. */
+        if (prev_overtake_mode == 0 && overtake_mode != 0 && shadow_midi_inject_shm &&
+            shadow_shift_held) {
+            int wr = shadow_midi_inject_shm->write_idx;
+            if (wr + 4 <= SHADOW_MIDI_INJECT_BUFFER_SIZE) {
+                shadow_midi_inject_shm->buffer[wr]     = 0x0B;
+                shadow_midi_inject_shm->buffer[wr + 1] = 0xB0;
+                shadow_midi_inject_shm->buffer[wr + 2] = CC_SHIFT;
+                shadow_midi_inject_shm->buffer[wr + 3] = 0;
+                wr += 4;
+                shadow_midi_inject_shm->write_idx = wr;
+                __sync_synchronize();
+                shadow_midi_inject_shm->ready++;
+                shadow_log("Overtake entry with shift held: injected shift-off");
+            }
         }
         /* Clear JACK display override on overtake exit (always — Move needs display back) */
         if (prev_overtake_mode != 0 && overtake_mode == 0 && g_jack_shm) {
@@ -5120,7 +5500,8 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
                             filter = 1;
                         }
                         /* Filter Menu and Jog Click CCs when Shift+Volume shortcut is active */
-                        if ((d1 == CC_MENU || d1 == CC_JOG_CLICK) && shadow_shift_held && shadow_volume_knob_touched) {
+                        if ((d1 == CC_MENU || d1 == CC_JOG_CLICK) &&
+                            SHIFT_VOL_ACTIVE() && shadow_shift_held && shadow_volume_knob_touched) {
                             filter = 1;
                         }
                     }
@@ -5332,6 +5713,46 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
     /* Skip post-ioctl processing in baseline mode */
     if (spi_baseline_mode) goto post_timing;
 
+    /* === EARLY (UNGATED) CC 115 / CC 114 JACK-DETECT ===
+     * The full handler below is gated on shadow_inprocess_ready, which is
+     * set ~hundreds of ms into boot after shadow chain init runs. XMOS
+     * broadcasts CC 115 within ~180ms of shim init at every boot, so the
+     * gated handler usually misses the only CC 115 we get. That left
+     * shadow_speaker_active stuck at its default of 1, applying speaker EQ
+     * to headphone output (the "hollow / phasey" bug). Detect CC 115 here,
+     * before any gating, so we have correct jack state from frame 1.
+     * MIDI_IN events are 8 bytes (4 USB-MIDI + 4 timestamp). */
+    if (hardware_mmap_addr) {
+        const uint8_t *src_early = hardware_mmap_addr + MIDI_IN_OFFSET;
+        for (int j = 0; j < MIDI_BUFFER_SIZE; j += 8) {
+            uint8_t cin   = src_early[j] & 0x0F;
+            uint8_t cable = (src_early[j] >> 4) & 0x0F;
+            if (cable != 0x00) continue;
+            if (cin != 0x0B) continue;
+            uint8_t status = src_early[j + 1];
+            uint8_t d1     = src_early[j + 2];
+            uint8_t d2     = src_early[j + 3];
+            if ((status & 0xF0) != 0xB0) continue;
+
+            if (d1 == CC_LINE_OUT_DETECT) {
+                int new_speaker = (d2 == 0) ? 1 : 0;
+                shadow_speaker_active_known = 1;
+                if (new_speaker != shadow_speaker_active) {
+                    shadow_speaker_active = new_speaker;
+                    if (shadow_control) shadow_control->speaker_active = (uint8_t)new_speaker;
+                    memset(speaker_eq_state, 0, sizeof(speaker_eq_state));
+                }
+            } else if (d1 == CC_MIC_IN_DETECT) {
+                int new_line_in = (d2 == 0) ? 0 : 1;  /* d2=0 → no cable (internal mic); d2=127 → cable plugged */
+                shadow_line_in_connected_known = 1;
+                if (new_line_in != shadow_line_in_connected) {
+                    shadow_line_in_connected = new_line_in;
+                    if (shadow_control) shadow_control->line_in_connected = (uint8_t)new_line_in;
+                }
+            }
+        }
+    }
+
     /* === POST-IOCTL: TRACK BUTTON AND VOLUME KNOB DETECTION ===
      * Scan for track button CCs (40-43) for D-Bus volume sync,
      * and volume knob touch (note 8) for master volume display reading.
@@ -5365,6 +5786,19 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
                         snprintf(msg, sizeof(msg),
                                  "CC 115 line-out detect: val=%d → speaker_active=%d",
                                  d2, new_speaker);
+                        shadow_log(msg);
+                    }
+                }
+
+                if (d1 == CC_MIC_IN_DETECT) {
+                    int new_line_in = (d2 == 0) ? 0 : 1;
+                    if (new_line_in != shadow_line_in_connected) {
+                        shadow_line_in_connected = new_line_in;
+                        if (shadow_control) shadow_control->line_in_connected = (uint8_t)new_line_in;
+                        char msg[64];
+                        snprintf(msg, sizeof(msg),
+                                 "CC 114 line-in detect: val=%d → line_in_connected=%d",
+                                 d2, new_line_in);
                         shadow_log(msg);
                     }
                 }
@@ -5415,7 +5849,7 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
                         }
 
                         /* Shift + Volume + Track = jump to that slot's edit screen (if shadow UI enabled) */
-                        if (shadow_shift_held && shadow_volume_knob_touched && shadow_control && shadow_ui_enabled) {
+                        if (SHIFT_VOL_ACTIVE() && shadow_shift_held && shadow_volume_knob_touched && shadow_control && shadow_ui_enabled) {
                             shadow_block_plain_volume_hide_until_release = 1;
                             shadow_control->ui_slot = new_slot;
                             shadow_control->ui_flags |= SHADOW_UI_FLAG_JUMP_TO_SLOT;
@@ -5450,18 +5884,24 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
                             clock_gettime(CLOCK_MONOTONIC, &track_press_time[lp_slot]);
                             track_longpress_pending[lp_slot] = 1;
                             track_longpress_fired[lp_slot] = 0;
+                            track_vol_touched_during_press[lp_slot] =
+                                shadow_volume_knob_touched ? 1 : 0;
                         } else {
                             /* Released before threshold — if shadow UI displayed, dismiss it.
                              * Skip if Shift+Vol is held (Shift+Vol+Track opens shadow;
-                             * releasing Track shouldn't immediately dismiss it). */
+                             * releasing Track shouldn't immediately dismiss it).
+                             * Skip if vol was touched during the press (volume tweak gesture
+                             * shouldn't side-effect into dismissing shadow UI). */
                             if (track_longpress_pending[lp_slot] && !track_longpress_fired[lp_slot] &&
                                 shadow_display_mode && shadow_control &&
+                                !track_vol_touched_during_press[lp_slot] &&
                                 !(shadow_shift_held && shadow_volume_knob_touched)) {
                                 shadow_display_mode = 0;
                                 shadow_control->display_mode = 0;
                                 shadow_log("Track tap: dismissing shadow UI");
                             }
                             track_longpress_pending[lp_slot] = 0;
+                            track_vol_touched_during_press[lp_slot] = 0;
                         }
                     }
                 }
@@ -5493,7 +5933,7 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
 
                 /* Shift + Volume + Back = suspend overtake (JACK keeps running) */
                 if (d1 == CC_BACK && d2 > 0) {
-                    if (shadow_shift_held && shadow_volume_knob_touched && shadow_control &&
+                    if (SHIFT_VOL_ACTIVE() && shadow_shift_held && shadow_volume_knob_touched && shadow_control &&
                         shadow_ui_enabled && shadow_control->overtake_mode >= 2) {
                         shadow_control->suspend_overtake = 1;
                         shadow_control->ui_flags |= SHADOW_UI_FLAG_JUMP_TO_OVERTAKE;
@@ -5504,7 +5944,7 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
 
                 /* Shift + Volume + Jog Click = toggle overtake module menu (if shadow UI enabled) */
                 if (d1 == CC_JOG_CLICK && d2 > 0) {
-                    if (shadow_shift_held && shadow_volume_knob_touched && shadow_control && shadow_ui_enabled) {
+                    if (SHIFT_VOL_ACTIVE() && shadow_shift_held && shadow_volume_knob_touched && shadow_control && shadow_ui_enabled) {
                         if (!shadow_display_mode) {
                             /* From Move mode: launch shadow UI and show overtake menu */
                             shadow_control->ui_flags |= SHADOW_UI_FLAG_JUMP_TO_OVERTAKE;
@@ -5520,9 +5960,12 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
                     }
                 }
 
-                /* Skipback: Shift+Capture or Shift+Vol+Capture (configurable) */
+                /* Skipback: Shift+Capture or Shift+Vol+Capture (configurable). When Shift+Vol
+                 * shortcuts are gated off, the require-volume mode is unreachable, so fall
+                 * back to bare Shift+Capture in that case. */
                 if (d1 == CC_CAPTURE && d2 > 0 && shadow_shift_held) {
                     int require_vol = shadow_control ? shadow_control->skipback_require_volume : 0;
+                    if (require_vol && !SHIFT_VOL_ACTIVE()) require_vol = 0;
                     if (!require_vol || shadow_volume_knob_touched) {
                         skipback_trigger_save();
                         src[j] = 0; src[j+1] = 0; src[j+2] = 0; src[j+3] = 0;
@@ -5530,7 +5973,7 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
                 }
 
                 /* Shift+Vol+Left/Right: set page navigation (when enabled) */
-                if (shadow_control && shadow_control->set_pages_enabled &&
+                if (SHIFT_VOL_ACTIVE() && shadow_control && shadow_control->set_pages_enabled &&
                     shadow_shift_held && shadow_volume_knob_touched && d2 > 0) {
                     if (d1 == CC_LEFT && set_page_current > 0) {
                         shadow_change_set_page(set_page_current - 1);
@@ -5681,7 +6124,7 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
 
                 /* Shift + Volume + Step 2 (note 17) = jump to Global Settings */
                 if (d1 == 17 && type == 0x90 && d2 > 0) {
-                    if (shadow_shift_held && shadow_volume_knob_touched && shadow_control && shadow_ui_enabled) {
+                    if (SHIFT_VOL_ACTIVE() && shadow_shift_held && shadow_volume_knob_touched && shadow_control && shadow_ui_enabled) {
                         shadow_block_plain_volume_hide_until_release = 1;
                         shadow_control->ui_flags |= SHADOW_UI_FLAG_JUMP_TO_SETTINGS;
                         /* Always ensure display shows shadow UI */
@@ -5697,7 +6140,7 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
 
                 /* Shift + Volume + Step 13 (note 28) = jump to Tools menu */
                 if (d1 == 28 && type == 0x90 && d2 > 0) {
-                    if (shadow_shift_held && shadow_volume_knob_touched && shadow_control && shadow_ui_enabled) {
+                    if (SHIFT_VOL_ACTIVE() && shadow_shift_held && shadow_volume_knob_touched && shadow_control && shadow_ui_enabled) {
                         shadow_block_plain_volume_hide_until_release = 1;
                         shadow_control->ui_flags |= SHADOW_UI_FLAG_JUMP_TO_TOOLS;
                         /* Always ensure display shows shadow UI */
@@ -5710,16 +6153,24 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
                         src[j] = 0; src[j+1] = 0; src[j+2] = 0; src[j+3] = 0;
                     } else if (LONG_PRESS_ACTIVE() && shadow_shift_held &&
                                !shadow_volume_knob_touched && shadow_control && shadow_ui_enabled) {
-                        /* Shift+Step13 without Vol — immediate tools shortcut */
+                        /* Shift+Step13 without Vol — immediate tools shortcut.
+                         * Also start a long-press timer; if held past 500ms we
+                         * fire the resume-last-tool path. */
                         shadow_control->ui_flags |= SHADOW_UI_FLAG_JUMP_TO_TOOLS;
                         shadow_display_mode = 1;
                         shadow_control->display_mode = 1;
                         launch_shadow_ui();
+                        clock_gettime(CLOCK_MONOTONIC, &step13_press_time);
+                        step13_longpress_pending = 1;
+                        step13_longpress_fired = 0;
                         uint8_t *sh = shadow + MIDI_IN_OFFSET;
                         sh[j] = 0; sh[j+1] = 0; sh[j+2] = 0; sh[j+3] = 0;
                         src[j] = 0; src[j+1] = 0; src[j+2] = 0; src[j+3] = 0;
                         shadow_log("Shift+Step13: opening tools");
                     }
+                }
+                if (d1 == 28 && (type == 0x80 || (type == 0x90 && d2 == 0))) {
+                    step13_longpress_pending = 0;
                 }
 
                 /* Shift + Step button while shadow UI is displayed = dismiss shadow UI

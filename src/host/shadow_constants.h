@@ -28,6 +28,7 @@
 #define SHM_SHADOW_MIDI_OUT   "/schwung-midi-out"   /* MIDI output from shadow UI */
 #define SHM_SHADOW_MIDI_DSP   "/schwung-midi-dsp"   /* MIDI from shadow UI to DSP slots */
 #define SHM_SHADOW_MIDI_INJECT "/schwung-midi-inject" /* MIDI inject into Move's MIDI_IN */
+#define SHM_SHADOW_EXT_MIDI_REMAP "/schwung-ext-midi-remap" /* Cable-2 channel remap table */
 #define SHM_SHADOW_SCREENREADER "/schwung-screenreader" /* Screen reader announcements */
 #define SHM_SHADOW_OVERLAY  "/schwung-overlay"  /* Overlay state (sampler/skipback) */
 #define SHM_DISPLAY_LIVE    "/schwung-display-live"    /* Live display for remote viewer */
@@ -50,7 +51,7 @@
  * MIDI_OUT must be bounded by this to avoid corrupting the display. */
 #define HW_MIDI_OUT_SIZE    80
 #define DISPLAY_BUFFER_SIZE 1024  /* 128x64 @ 1bpp = 1024 bytes */
-#define CONTROL_BUFFER_SIZE 64
+#define CONTROL_BUFFER_SIZE 72  /* bumped for sampler_source_request + sampler_silent (PR #61); leaves headroom in reserved[] */
 #define SHADOW_UI_BUFFER_SIZE     512
 #define SHADOW_PARAM_BUFFER_SIZE  65664  /* Large buffer for complex ui_hierarchy */
 #define SHADOW_MIDI_OUT_BUFFER_SIZE 512  /* MIDI out buffer from shadow UI (128 packets) */
@@ -147,11 +148,14 @@ typedef struct shadow_control_t {
     volatile uint8_t pad_block;            /* 1=suppress pad notes (68-99) from reaching Move */
     volatile uint8_t suspend_overtake;  /* 1=suspend (skip exit hook), 0=normal exit */
     volatile uint8_t open_tool_cmd;     /* 0=none, 1=open tool (path in /data/UserData/schwung/open_tool_cmd.json) */
-    volatile uint8_t long_press_shadow; /* 1=enable long-press Track/Menu/Step2 shortcuts */
+    volatile uint8_t shadow_ui_trigger; /* Shadow UI trigger mode: 0=long-press only, 1=Shift+Vol only, 2=both */
     volatile uint8_t speaker_active;    /* 1=built-in speaker active (from CC 115 line-out detect) */
-    /* Compiler inserts 1 byte of padding here for uint16 alignment. */
+    volatile uint8_t line_in_connected; /* 1=line-in cable plugged (from CC 114 mic-in detect); 0=internal mic */
+    volatile uint8_t sampler_source_request; /* 0=no request, 1=set Resample, 2=set Move Input. Shim resets to 0 after applying. */
+    volatile uint8_t sampler_silent;     /* 1=suppress sampler screen-reader announcements (e.g. "Sample saved") for tool-driven recordings */
     volatile uint16_t skipback_seconds; /* Skipback rolling buffer length: 30/60/120/180/240/300 */
-    volatile uint8_t reserved[2];
+    volatile uint8_t resume_last_tool;  /* 1=JUMP_TO_TOOLS should resume the most-recently-suspended tool instead of opening the menu */
+    volatile uint8_t reserved[6];
 } shadow_control_t;
 
 /*
@@ -220,6 +224,29 @@ typedef struct shadow_midi_inject_t {
     volatile uint8_t reserved[2];
     uint8_t buffer[SHADOW_MIDI_INJECT_BUFFER_SIZE];  /* USB-MIDI packets (4 bytes each) */
 } shadow_midi_inject_t;
+
+/*
+ * Cable-2 (external USB) MIDI channel remap table.
+ * Active overtake module writes; shim reads on every SPI frame and
+ * rewrites the channel byte of cable-2 MIDI_IN events before Move
+ * firmware processes them. Solves the cable-2 echo cascade by
+ * remapping in-place rather than re-injecting from JS.
+ *
+ * Disabled globally whenever any chain slot is configured forward=THRU
+ * (MPE passthrough). Reset to all-passthrough by the shim on overtake
+ * exit (forced — never trusted to JS, since shadow_ui cleanup may not
+ * run on crash).
+ */
+typedef struct schwung_ext_midi_remap_t {
+    volatile uint8_t version;        /* 1 = current contract version */
+    volatile uint8_t enabled;        /* 0 = bypass, 1 = active */
+    volatile uint8_t remap[16];      /* remap[in_ch] = out_ch (0-indexed).
+                                      * 0xFF = passthrough for that channel. */
+    uint8_t _reserved[46];           /* reserved for v2 (per-source remap, etc) */
+} schwung_ext_midi_remap_t;          /* 64 bytes total */
+
+#define EXT_MIDI_REMAP_PASSTHROUGH 0xFF
+#define EXT_MIDI_REMAP_VERSION     1
 
 /*
  * Web UI param set ring — web server writes, shim drains each audio block.
@@ -348,5 +375,6 @@ typedef char shadow_ui_state_size_check[(sizeof(shadow_ui_state_t) <= SHADOW_UI_
 typedef char shadow_param_size_check[(sizeof(shadow_param_t) <= SHADOW_PARAM_BUFFER_SIZE) ? 1 : -1];
 typedef char shadow_screenreader_size_check[(sizeof(shadow_screenreader_t) <= SHADOW_SCREENREADER_BUFFER_SIZE) ? 1 : -1];
 typedef char shadow_overlay_size_check[(sizeof(shadow_overlay_state_t) == SHADOW_OVERLAY_BUFFER_SIZE) ? 1 : -1];
+typedef char schwung_ext_midi_remap_size_check[(sizeof(schwung_ext_midi_remap_t) == 64) ? 1 : -1];
 
 #endif /* SHADOW_CONSTANTS_H */

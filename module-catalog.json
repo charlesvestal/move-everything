@@ -4,8 +4,8 @@
     "name": "Schwung",
     "github_repo": "charlesvestal/schwung",
     "asset_name": "schwung.tar.gz",
-    "latest_version": "0.9.7",
-    "download_url": "https://github.com/charlesvestal/schwung/releases/download/v0.9.7/schwung.tar.gz",
+    "latest_version": "0.9.10",
+    "download_url": "https://github.com/charlesvestal/schwung/releases/download/v0.9.10/schwung.tar.gz",
     "min_host_version": "0.1.0"
   },
   "modules": [
@@ -89,6 +89,18 @@
       "default_branch": "main",
       "asset_name": "cloudseed-module.tar.gz",
       "min_host_version": "0.3.0"
+    },
+    {
+      "id": "midiverb",
+      "name": "Midiverb",
+      "description": "Alesis Midiverb / Midifex / Midiverb II emulator (lo-fi 23.4 kHz reverb)",
+      "author": "thement (DSP) · Charles Vestal (port)",
+      "component_type": "audio_fx",
+      "github_repo": "charlesvestal/schwung-midiverb",
+      "default_branch": "main",
+      "asset_name": "midiverb-module.tar.gz",
+      "min_host_version": "0.3.0",
+      "requires": "Optional: original Midiverb / Midifex / Midiverb II ROM dumps for cycle-accurate emulation"
     },
     {
       "id": "tapescam",
@@ -559,6 +571,17 @@
       "min_host_version": "0.3.0"
     },
     {
+      "id": "guitar-tuner",
+      "name": "Guitar Tuner",
+      "description": "Chromatic tuner for guitar (and any other instrument). Nearest note and cents deviation on the OLED; big letter glyph on the pad grid. Uses the Move's mic or 3.5mm line-in.",
+      "author": "eightfour",
+      "component_type": "tool",
+      "github_repo": "eightfour-dev/schwung-guitar-tuner",
+      "default_branch": "main",
+      "asset_name": "guitar-tuner-module.tar.gz",
+      "min_host_version": "0.9.8"
+    },
+    {
       "id": "tuner",
       "name": "Tuner",
       "description": "Chromatic and instrument tuner with step guide feedback",
@@ -757,6 +780,28 @@
       "asset_name": "ai-assistant-module.tar.gz",
       "min_host_version": "0.9.8",
       "requires": "Gemini or OpenAI API key (free Gemini key at aistudio.google.com)"
+    },
+    {
+      "id": "303",
+      "name": "303",
+      "description": "TB-303 emulator (Open303 + Devilfish + Soft/RAT drive)",
+      "author": "Robin Schmidt / midilab / davemollen (port: charlesvestal)",
+      "component_type": "sound_generator",
+      "github_repo": "charlesvestal/schwung-303",
+      "default_branch": "main",
+      "asset_name": "303-module.tar.gz",
+      "min_host_version": "0.3.0"
+    },
+    {
+      "id": "tb3po",
+      "name": "TB-3PO",
+      "description": "Generative 303-style acid-bassline sequencer with dual slots and 303 CC mode",
+      "author": "djphazer / Hemisphere Suite (port: charlesvestal)",
+      "component_type": "tool",
+      "github_repo": "charlesvestal/schwung-tb3po",
+      "default_branch": "main",
+      "asset_name": "tb3po-module.tar.gz",
+      "min_host_version": "0.9.10"
     }
   ]
 }

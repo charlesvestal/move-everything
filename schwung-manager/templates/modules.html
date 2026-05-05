@@ -8,6 +8,31 @@
     <p>Browse and manage Schwung modules from the catalog.</p>
 </div>
 
+<section class="host-summary {{if .HostUpdateAvailable}}host-summary-update{{end}}" aria-label="Schwung Host">
+    <div class="host-summary-info">
+        <h2 class="host-summary-title">Schwung Host</h2>
+        <p class="host-summary-version">
+            Installed:
+            {{if .HostRepo}}<a href="{{releaseURL .HostRepo .HostVersion}}" target="_blank" rel="noopener noreferrer">v{{.HostVersion}}</a>{{else}}v{{.HostVersion}}{{end}}
+            {{if .HostUpdateAvailable}}
+            <span class="host-summary-latest">&rarr; v{{.HostLatestVersion}} available</span>
+            {{end}}
+        </p>
+    </div>
+    <div class="host-summary-actions">
+        {{if .HostUpdateAvailable}}
+        <form method="POST" action="/system/upgrade" class="inline-form"
+              data-confirm="Upgrade to {{.HostLatestVersion}}? This will restart the service." data-confirm-title="Upgrade Schwung" data-confirm-label="Upgrade">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <button type="submit" class="btn btn-primary">Upgrade to v{{.HostLatestVersion}}</button>
+        </form>
+        {{if .HostRepo}}<a class="release-notes-link" href="{{releaseURL .HostRepo .HostLatestVersion}}" target="_blank" rel="noopener noreferrer">release notes</a>{{end}}
+        {{else}}
+        <a href="/system" class="btn btn-secondary btn-small">System</a>
+        {{end}}
+    </div>
+</section>
+
 {{if not .Modules}}
 <div class="empty-state">
     <p>Could not load module catalog. Check your network connection.</p>
@@ -70,6 +95,9 @@
         </article>
         {{end}}{{end}}
     </div>
+    <div class="bulk-actions bulk-actions-update" style="display:flex;gap:.5rem;margin-top:.75rem;align-items:center;flex-wrap:wrap">
+        <button type="button" class="btn btn-secondary btn-update-all">Update All</button>
+    </div>
     {{end}}
 
     <h2 class="section-header" id="grid-available-header">Available</h2>
@@ -128,6 +156,9 @@
             </tbody>
         </table>
     </div>
+    <div class="bulk-actions bulk-actions-update" style="display:flex;gap:.5rem;margin-top:.75rem;align-items:center;flex-wrap:wrap">
+        <button type="button" class="btn btn-secondary btn-update-all">Update All</button>
+    </div>
     {{end}}
 
     <h2 class="section-header" id="list-available-header">Available</h2>
@@ -160,6 +191,118 @@
     </div>
 </div>
 
+<div class="bulk-actions" style="display:flex;gap:.5rem;margin-top:1rem;align-items:center;flex-wrap:wrap">
+    <button type="button" class="btn btn-primary" id="btn-install-all">Install All</button>
+    <div class="bulk-progress" id="bulk-progress" style="display:none;flex:1;min-width:240px;margin-left:.5rem" aria-live="polite">
+        <div style="display:flex;justify-content:space-between;font-size:.85rem">
+            <span id="bulk-status">Working…</span>
+            <span id="bulk-detail"></span>
+        </div>
+        <div style="height:6px;background:#222;border-radius:3px;overflow:hidden;margin-top:.25rem">
+            <div id="bulk-bar-fill" style="height:100%;width:0%;background:var(--accent,#5af);transition:width .15s"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+(function() {
+    var csrfToken = (document.cookie.match(/(^| )csrf_token=([^;]+)/) || [])[2] || '';
+    var installBtn = document.getElementById('btn-install-all');
+    var updateBtns = document.querySelectorAll('.btn-update-all');
+    var progressEl = document.getElementById('bulk-progress');
+    var statusEl = document.getElementById('bulk-status');
+    var detailEl = document.getElementById('bulk-detail');
+    var barFill = document.getElementById('bulk-bar-fill');
+
+    function setProgress(current, total, name, label) {
+        progressEl.style.display = '';
+        statusEl.textContent = label + ' ' + current + ' of ' + total + (name ? ': ' + name : '');
+        detailEl.textContent = '';
+        barFill.style.width = (total > 0 ? Math.round((current / total) * 100) : 0) + '%';
+    }
+
+    function postAction(actionUrl) {
+        var fd = new FormData();
+        fd.append('csrf_token', csrfToken);
+        return fetch(actionUrl, {
+            method: 'POST',
+            body: fd,
+            credentials: 'same-origin',
+            headers: { 'X-CSRF-Token': csrfToken }
+        }).then(function(resp) { return { url: actionUrl, ok: resp.ok, status: resp.status }; })
+          .catch(function(err) { return { url: actionUrl, ok: false, err: String(err) }; });
+    }
+
+    // Collect targets by scanning rendered forms — this inherits the
+    // server's hasUpdate / installed logic, so Update All only touches
+    // modules with the Update button visible on the page.
+    function collectTargets(suffix) {
+        var seen = {};
+        var targets = [];
+        var forms = document.querySelectorAll('form[action$="/' + suffix + '"]');
+        forms.forEach(function(f) {
+            var action = f.getAttribute('action');
+            if (seen[action]) return;
+            seen[action] = true;
+            var card = f.closest('[data-name]');
+            var name = card ? (card.getAttribute('data-name') || '') : '';
+            // Skip the bulk-action form itself.
+            if (action === '/modules/install-all' || action === '/modules/update-all') return;
+            // Skip custom-install actions (no module ID).
+            if (action.indexOf('/modules/') !== 0) return;
+            targets.push({ url: action, name: name });
+        });
+        return targets;
+    }
+
+    function setBtnsDisabled(disabled) {
+        installBtn.disabled = disabled;
+        updateBtns.forEach(function(b) { b.disabled = disabled; });
+    }
+
+    function runBulk(label, suffix, emptyMsg) {
+        setBtnsDisabled(true);
+        var targets = collectTargets(suffix);
+        if (targets.length === 0) {
+            progressEl.style.display = '';
+            statusEl.textContent = emptyMsg;
+            detailEl.textContent = '';
+            barFill.style.width = '100%';
+            setBtnsDisabled(false);
+            return;
+        }
+        var ok = 0, failed = 0, idx = 0;
+        function next() {
+            if (idx >= targets.length) {
+                statusEl.textContent = label + ' done — ' + ok + ' ok' + (failed ? ', ' + failed + ' failed' : '');
+                detailEl.textContent = '';
+                barFill.style.width = '100%';
+                setTimeout(function() { window.location.reload(); }, 1200);
+                return;
+            }
+            var t = targets[idx++];
+            setProgress(idx, targets.length, t.name, label);
+            postAction(t.url).then(function(res) {
+                if (res.ok) ok++; else { failed++; console.warn('bulk failure', res); }
+                next();
+            });
+        }
+        next();
+    }
+
+    installBtn.addEventListener('click', function() {
+        if (!confirm('Install every uninstalled module from the catalog?')) return;
+        runBulk('Installing', 'install', 'All modules already installed');
+    });
+    updateBtns.forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            if (!confirm('Update every module that has an update available?')) return;
+            runBulk('Updating', 'update', 'All modules are up to date');
+        });
+    });
+})();
+</script>
+
 <details class="custom-install-section">
     <summary>Install Custom Module</summary>
     <div class="custom-install-content">
@@ -181,7 +324,7 @@
                 <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
                 <input type="hidden" name="source" value="tarball">
                 <label for="tarball-upload" class="sr-only">Module tarball file</label>
-                <input type="file" id="tarball-upload" name="file" accept=".tar.gz,.tgz" required>
+                <input type="file" id="tarball-upload" name="file" accept=".tar.gz,.tgz,.gz,application/gzip,application/x-gzip,application/x-tar,application/x-compressed-tar" required>
                 <button type="submit" class="btn btn-primary">Install from File</button>
             </form>
         </div>
