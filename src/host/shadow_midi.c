@@ -425,15 +425,16 @@ void shadow_drain_midi_inject(void)
     const int DEFER_FRAMES = 2;
     static int defer_counter = 0;
     uint8_t *midi_in_scan = host_shadow_mailbox + MIDI_IN_OFFSET;
-    int cable0_active = 0;
+    int hw_cable_active = 0;
     for (int j = 0; j < MIDI_IN_MAX_BYTES; j += MIDI_IN_EVT_STRIDE) {
-        if (midi_in_scan[j] == 0) break;      /* end-of-events */
-        if ((midi_in_scan[j] >> 4) == 0) {    /* cable 0 */
-            cable0_active = 1;
+        if (midi_in_scan[j] == 0) break;
+        int cable = midi_in_scan[j] >> 4;
+        if (cable == 0 || cable == 2) {   /* cable 0 (pads/hw) or cable 2 (external MIDI) */
+            hw_cable_active = 1;
             break;
         }
     }
-    if (cable0_active) {
+    if (hw_cable_active) {
         defer_counter = 0;
         return;
     }
