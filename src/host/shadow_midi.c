@@ -409,6 +409,30 @@ void shadow_drain_midi_inject(void)
 
     if (!inject_shm) return;
 
+    /* Hold inject drain for a few frames after overtake mode exits to prevent
+     * DSP-generated note packets from racing Move's MIDI_IN read during the
+     * transition from shadow to native mode.  The overtake exit injects 4
+     * cleanup packets (shift/back/jog/vol releases) that drain cleanly, but
+     * the DSP audio callback queues additional note events (e.g. drum hits on
+     * ROUTE_MOVE) in the same window — those arrive 1-2 frames later and land
+     * while Move's firmware is mid-transition, causing SIGABRT deep in Move's
+     * stack.  Three frames (~9 ms) of settling eliminates the race.
+     * Packets accumulate in inject_shm and drain after the hold, so no
+     * events are lost. */
+    {
+        static int prev_overtake_hold = 0;
+        static int exit_hold = 0;
+        shadow_control_t *sc = host_shadow_control ? *host_shadow_control : NULL;
+        int cur_overtake = sc ? (int)sc->overtake_mode : 0;
+        if (prev_overtake_hold != 0 && cur_overtake == 0)
+            exit_hold = 2;
+        prev_overtake_hold = cur_overtake;
+        if (exit_hold > 0) {
+            exit_hold--;
+            return;
+        }
+    }
+
     /* Defer cable-2 injection when there's cable-0 hardware activity in the
      * SAME tick. Injecting concurrently with a live pad event appears to
      * race Move's firmware (observed: SIGABRT deep in Move's stack after
@@ -425,15 +449,16 @@ void shadow_drain_midi_inject(void)
     const int DEFER_FRAMES = 2;
     static int defer_counter = 0;
     uint8_t *midi_in_scan = host_shadow_mailbox + MIDI_IN_OFFSET;
-    int cable0_active = 0;
+    int hw_cable_active = 0;
     for (int j = 0; j < MIDI_IN_MAX_BYTES; j += MIDI_IN_EVT_STRIDE) {
-        if (midi_in_scan[j] == 0) break;      /* end-of-events */
-        if ((midi_in_scan[j] >> 4) == 0) {    /* cable 0 */
-            cable0_active = 1;
+        if (midi_in_scan[j] == 0) break;
+        int cable = midi_in_scan[j] >> 4;
+        if (cable == 0 || cable == 2) {   /* cable 0 (pads/hw) or cable 2 (external MIDI) */
+            hw_cable_active = 1;
             break;
         }
     }
-    if (cable0_active) {
+    if (hw_cable_active) {
         defer_counter = 0;
         return;
     }
